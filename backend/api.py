@@ -17,7 +17,9 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import calc_engine as eng
+import course_template
 import db
+import diagnostics
 import export_report
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -66,8 +68,11 @@ def login(payload: dict):
         ).fetchone()
     if not user or not db.verify_password(password, user["password_hash"]):
         raise HTTPException(401, "账号或密码错误")
+    if not user["is_active"]:
+        raise HTTPException(403, "该账号已被管理员禁用，请联系教务管理员")
 
-    token = db.make_token(user["id"], user["username"])
+    role = user["role"] or "teacher"
+    token = db.make_token(user["id"], user["username"], role)
     return {
         "ok": True,
         "token": token,
@@ -76,6 +81,7 @@ def login(payload: dict):
             "username": user["username"],
             "name": user["name"],
             "department": user["department"],
+            "role": role,
         },
     }
 
@@ -600,6 +606,194 @@ def get_report_detail(report_id: int):
 def remove_report(report_id: int):
     db.delete_class_report(report_id)
     return {"ok": True}
+
+
+@app.patch("/api/reports/{report_id}/notes")
+def update_notes(report_id: int, payload: dict):
+    db.update_report_notes(report_id, payload.get("improvement_notes", ""))
+    return {"ok": True}
+
+
+@app.get("/api/reports/{report_id}/export")
+def export_history_report(report_id: int):
+    """根据历史报告快照一键重新导出三 Sheet《达成度计算表.xlsx》。"""
+    try:
+        rec = db.get_class_report(report_id)
+        course = db.get_active_course(rec["course_id"])
+        questions = eng.validate_structure()
+        lw = eng.step1_link_weights()
+        output, full = eng.step2_output_weights(lw)
+        paper_full = eng.paper_target_full(questions)
+        meta = {
+            "课程名称": rec["course_name"],
+            "学期": rec["semester"],
+            "班级": rec["class_name"],
+        }
+        buf = export_report.build_workbook(
+            rec["students"],
+            output,
+            full,
+            questions,
+            paper_full,
+            meta,
+            threshold=float(rec["pass_threshold"] or 0.65),
+        )
+        return StreamingResponse(
+            buf,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": (
+                    "attachment; filename=history_report.xlsx; "
+                    "filename*=UTF-8''%E8%BE%BE%E6%88%90%E5%BA%A6%E8%AE%A1%E7%AE%97%E8%A1%A8.xlsx"
+                )
+            },
+        )
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+# ============================================================
+# 六、公共课程规则模板库（管理员 Excel 导入发布 + 教师一键选用）
+# ============================================================
+
+@app.get("/api/templates/courses")
+def list_public_course_templates():
+    """获取全院公共课程规则模板库列表，供教师一键选用。"""
+    return {"ok": True, "templates": db.list_courses(only_public=True)}
+
+
+@app.get("/api/templates/course-config-excel")
+def download_course_config_excel():
+    """下载标准《课程规则配置模板.xlsx》（管理员填写后可一键导入发布）。"""
+    buf = course_template.build_course_config_template(
+        meta=META,
+        threshold=eng.PASS_THRESHOLD,
+        method=eng.METHOD,
+        matrix=eng.MATRIX,
+        paper=eng.PAPER_STRUCTURE,
+        target_descriptions=ACTIVE_STATE.get("target_descriptions", {}),
+    )
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": (
+                "attachment; filename=course_config_template.xlsx; "
+                "filename*=UTF-8''%E8%AF%BE%E7%A8%8B%E8%A7%84%E5%88%99%E9%85%8D%E7%BD%AE%E6%A8%A1%E6%9D%BF.xlsx"
+            )
+        },
+    )
+
+
+@app.post("/api/templates/import-excel")
+async def import_course_config_excel(
+    file: UploadFile = File(...),
+    is_public: bool = Form(default=True),
+):
+    """管理员上传《课程规则配置模板.xlsx》，一键校验并发布到公共课程模板库。"""
+    path = _save_upload(file)
+    try:
+        parsed = course_template.parse_course_config_excel(path)
+        created = db.create_course(parsed, is_public=is_public)
+        return {"ok": True, "message": "课程规则模板导入成功", "course": created}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@app.post("/api/templates/{course_id}/apply")
+def apply_public_template(course_id: int):
+    """教师一键选用某个公共课程模板（加载到当前工作台）。"""
+    try:
+        state = _sync_active(course_id)
+        return {"ok": True, "message": f"已选用模板：{state['meta']['课程名称']}", "config": state}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+# ============================================================
+# 七、管理员端：教师账号管理与全院达成度汇总监控
+# ============================================================
+
+@app.get("/api/admin/users")
+def admin_list_users():
+    return {"ok": True, "users": db.list_users()}
+
+
+@app.post("/api/admin/users")
+def admin_create_user(payload: dict):
+    try:
+        u = db.create_user(
+            username=(payload.get("username") or "").strip(),
+            password=payload.get("password") or "123456",
+            name=(payload.get("name") or "").strip() or payload.get("username", ""),
+            department=(payload.get("department") or "").strip(),
+            role=payload.get("role") or "teacher",
+        )
+        return {"ok": True, "user": u}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.patch("/api/admin/users/{user_id}/toggle")
+def admin_toggle_user(user_id: int):
+    try:
+        return {"ok": True, "user": db.toggle_user_active(user_id)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/admin/users/{user_id}/reset-password")
+def admin_reset_password(user_id: int, payload: dict | None = None):
+    try:
+        new_pwd = (payload or {}).get("password") or "123456"
+        db.reset_user_password(user_id, new_pwd)
+        return {"ok": True, "message": f"密码已重置为 {new_pwd}"}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/admin/overview")
+def admin_overview():
+    return {"ok": True, "overview": db.get_college_overview()}
+
+
+# ============================================================
+# 八、OBE 教学诊断 Agent 下钻分析接口（预留大模型接入点）
+# ============================================================
+
+@app.post("/api/diagnostics/analyze")
+def diagnostics_analyze(payload: dict):
+    """基于 4 维下钻统计工具生成达成情况诊断数据与持续改进措施草稿。"""
+    try:
+        students = payload.get("students") or []
+        threshold = float(payload.get("threshold", eng.PASS_THRESHOLD))
+        meta = dict(META)
+        if payload.get("meta"):
+            meta.update(payload["meta"])
+
+        questions = eng.validate_structure()
+        lw = eng.step1_link_weights()
+        output, full = eng.step2_output_weights(lw)
+        paper_full = eng.paper_target_full(questions)
+        norm_students = eng.validate_and_normalize_records(students, questions)
+        report = eng.step5_report(norm_students, output, full, questions, threshold=threshold)
+
+        diag = diagnostics.generate_diagnostic_report(
+            course_id=ACTIVE_STATE["course_id"],
+            meta=meta,
+            students=norm_students,
+            report=report,
+            output_weights=output,
+            full_scores=full,
+            questions=questions,
+            paper_full=paper_full,
+            threshold=threshold,
+        )
+        return {"ok": True, "diagnostics": diag}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 # ============================================================

@@ -1,13 +1,13 @@
 """数据库持久化层（轻重解耦设计）
 
 存储三张核心表：
-  1. users         — 教师账号表（工号/账号、加密密码、姓名）
-  2. courses       — 课程与达成度规则配置表（课程元信息 + method/matrix/paper JSON，支持跨班级复用）
+  1. users         — 教师与管理员账号表（工号/账号、加盐哈希密码、姓名、院系、角色、启用状态）
+  2. courses       — 课程与达成度规则模板表（含公共课程模板标识 is_public，支持管理员发布与教师跨班复用）
   3. class_reports — 班级达成度历史报告表（班级名、人数、达成度汇总 JSON、确认后的学生成绩快照 JSON、持续改进记录）
 
 说明：
 - 默认使用内置 SQLite（backend/attainment.db），开箱即用无需额外部署数据库服务；
-- 表结构符合标准关系型数据库规范（主键、外键、JSON 文本、时间戳），可无缝迁移至 MySQL。
+- 表结构符合标准关系型数据库规范（主键、外键、JSON 文本、时间戳），后续可无缝切换 SQLAlchemy + MySQL。
 """
 
 import hashlib
@@ -45,8 +45,8 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(hash_password(password, salt), stored)
 
 
-def make_token(user_id: int, username: str) -> str:
-    payload = f"{user_id}:{username}"
+def make_token(user_id: int, username: str, role: str = "teacher") -> str:
+    payload = f"{user_id}:{username}:{role}"
     sig = hmac.new(
         SECRET_KEY.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256
     ).hexdigest()[:24]
@@ -54,21 +54,27 @@ def make_token(user_id: int, username: str) -> str:
 
 
 def verify_token(token: str) -> dict | None:
-    if not token or token.count(":") != 2:
+    if not token or token.count(":") != 3:
         return None
-    uid_str, username, sig = token.split(":")
+    uid_str, username, role, sig = token.split(":")
     expected = hmac.new(
         SECRET_KEY.encode("utf-8"),
-        f"{uid_str}:{username}".encode("utf-8"),
+        f"{uid_str}:{username}:{role}".encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()[:24]
     if not hmac.compare_digest(sig, expected):
         return None
-    return {"id": int(uid_str), "username": username}
+    return {"id": int(uid_str), "username": username, "role": role}
+
+
+def _ensure_column(conn, table: str, column: str, col_def: str):
+    cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
 
 
 def init_db():
-    """初始化数据库表，并注入默认教师账号与默认示例课程。"""
+    """初始化数据库表与平滑字段迁移，并注入默认管理员、教师账号及默认公共课程模板。"""
     with _conn() as conn:
         conn.executescript(
             """
@@ -78,12 +84,15 @@ def init_db():
                 password_hash TEXT NOT NULL,
                 name TEXT NOT NULL,
                 department TEXT DEFAULT '',
+                role TEXT DEFAULT 'teacher',
+                is_active INTEGER DEFAULT 1,
                 created_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS courses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
+                is_public INTEGER DEFAULT 0,
                 course_name TEXT NOT NULL,
                 course_code TEXT DEFAULT '',
                 semester TEXT NOT NULL,
@@ -111,23 +120,42 @@ def init_db():
             """
         )
 
+        # 平滑兼容旧版数据库文件
+        _ensure_column(conn, "users", "role", "TEXT DEFAULT 'teacher'")
+        _ensure_column(conn, "users", "is_active", "INTEGER DEFAULT 1")
+        _ensure_column(conn, "courses", "is_public", "INTEGER DEFAULT 0")
+
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # 默认教师账号：teacher / 123456
+        # 1. 默认教师账号：teacher / 123456
         user = conn.execute(
             "SELECT id FROM users WHERE username = ?", ("teacher",)
         ).fetchone()
         if not user:
             cur = conn.execute(
-                "INSERT INTO users (username, password_hash, name, department, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO users (username, password_hash, name, department, role, is_active, created_at) "
+                "VALUES (?, ?, ?, ?, 'teacher', 1, ?)",
                 ("teacher", hash_password("123456"), "张老师", "智能制造学院", now),
             )
-            uid = cur.lastrowid
+            teacher_uid = cur.lastrowid
         else:
-            uid = user["id"]
+            teacher_uid = user["id"]
 
-        # 默认课程：《高等数学A（II）》
+        # 2. 默认管理员账号：admin / admin123
+        admin = conn.execute(
+            "SELECT id FROM users WHERE username = ?", ("admin",)
+        ).fetchone()
+        if not admin:
+            cur = conn.execute(
+                "INSERT INTO users (username, password_hash, name, department, role, is_active, created_at) "
+                "VALUES (?, ?, ?, ?, 'admin', 1, ?)",
+                ("admin", hash_password("admin123"), "教务管理员", "教务处", now),
+            )
+            admin_uid = cur.lastrowid
+        else:
+            admin_uid = admin["id"]
+
+        # 3. 默认公共课程模板：《高等数学A（II）》
         course = conn.execute("SELECT id FROM courses LIMIT 1").fetchone()
         if not course:
             default_cfg = {
@@ -141,10 +169,10 @@ def init_db():
             }
             conn.execute(
                 "INSERT INTO courses "
-                "(user_id, course_name, course_code, semester, default_class, pass_threshold, config_json, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "(user_id, is_public, course_name, course_code, semester, default_class, pass_threshold, config_json, updated_at) "
+                "VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    uid,
+                    admin_uid,
                     "高等数学A（II）",
                     "MATH1002",
                     "2023-2024-2",
@@ -154,7 +182,85 @@ def init_db():
                     now,
                 ),
             )
+        else:
+            # 确保首条默认高数课程被标记为公共模板，方便演示选用
+            conn.execute(
+                "UPDATE courses SET is_public = 1 WHERE course_code = 'MATH1002'"
+            )
 
+
+# ============================================================
+# 管理员：教师账号管理
+# ============================================================
+
+def list_users() -> list[dict]:
+    init_db()
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id, username, name, department, role, is_active, created_at "
+            "FROM users ORDER BY role ASC, id ASC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_user(username: str, password: str, name: str, department: str = "", role: str = "teacher") -> dict:
+    init_db()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if role not in ("teacher", "admin"):
+        raise ValueError("角色只能为 teacher 或 admin")
+    with _conn() as conn:
+        exists = conn.execute(
+            "SELECT id FROM users WHERE username = ?", (username,)
+        ).fetchone()
+        if exists:
+            raise ValueError(f"账号「{username}」已存在")
+        cur = conn.execute(
+            "INSERT INTO users (username, password_hash, name, department, role, is_active, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 1, ?)",
+            (username, hash_password(password), name, department, role, now),
+        )
+        uid = cur.lastrowid
+        row = conn.execute(
+            "SELECT id, username, name, department, role, is_active, created_at FROM users WHERE id = ?",
+            (uid,),
+        ).fetchone()
+    return dict(row)
+
+
+def toggle_user_active(user_id: int) -> dict:
+    init_db()
+    with _conn() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not row:
+            raise ValueError(f"未找到用户 ID={user_id}")
+        if row["username"] == "admin":
+            raise ValueError("不能禁用内置超级管理员账号")
+        new_state = 0 if row["is_active"] else 1
+        conn.execute("UPDATE users SET is_active = ? WHERE id = ?", (new_state, user_id))
+        updated = conn.execute(
+            "SELECT id, username, name, department, role, is_active, created_at FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+    return dict(updated)
+
+
+def reset_user_password(user_id: int, new_password: str = "123456"):
+    init_db()
+    if len(new_password) < 4:
+        raise ValueError("新密码至少 4 位")
+    with _conn() as conn:
+        row = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not row:
+            raise ValueError(f"未找到用户 ID={user_id}")
+        conn.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (hash_password(new_password), user_id),
+        )
+
+
+# ============================================================
+# 课程与公共课程规则模板库
+# ============================================================
 
 def get_active_course(course_id: int | None = None) -> dict:
     """读取指定课程（或最近更新的默认课程），并同步到 calc_engine 运行时配置。"""
@@ -180,6 +286,7 @@ def get_active_course(course_id: int | None = None) -> dict:
 
     return {
         "course_id": row["id"],
+        "is_public": bool(row["is_public"]),
         "method": cfg["method"],
         "matrix": cfg["matrix"],
         "paper": cfg["paper"],
@@ -220,24 +327,27 @@ def save_active_course(payload: dict, course_id: int | None = None) -> dict:
     course_code = meta.get("课程代码") or ""
     semester = meta.get("学期") or "2024-2025-1"
     default_class = meta.get("班级") or ""
+    is_public = 1 if payload.get("is_public") else 0
 
     cid = course_id or payload.get("course_id")
     with _conn() as conn:
         if cid:
             exists = conn.execute(
-                "SELECT id FROM courses WHERE id = ?", (cid,)
+                "SELECT id, is_public FROM courses WHERE id = ?", (cid,)
             ).fetchone()
         else:
             exists = conn.execute(
-                "SELECT id FROM courses ORDER BY updated_at DESC, id DESC LIMIT 1"
+                "SELECT id, is_public FROM courses ORDER BY updated_at DESC, id DESC LIMIT 1"
             ).fetchone()
 
         if exists:
             cid = exists["id"]
+            keep_public = is_public if "is_public" in payload else exists["is_public"]
             conn.execute(
-                "UPDATE courses SET course_name=?, course_code=?, semester=?, "
+                "UPDATE courses SET is_public=?, course_name=?, course_code=?, semester=?, "
                 "default_class=?, pass_threshold=?, config_json=?, updated_at=? WHERE id=?",
                 (
+                    keep_public,
                     course_name,
                     course_code,
                     semester,
@@ -251,9 +361,10 @@ def save_active_course(payload: dict, course_id: int | None = None) -> dict:
         else:
             cur = conn.execute(
                 "INSERT INTO courses "
-                "(user_id, course_name, course_code, semester, default_class, pass_threshold, config_json, updated_at) "
-                "VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
+                "(user_id, is_public, course_name, course_code, semester, default_class, pass_threshold, config_json, updated_at) "
+                "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
+                    is_public,
                     course_name,
                     course_code,
                     semester,
@@ -268,18 +379,27 @@ def save_active_course(payload: dict, course_id: int | None = None) -> dict:
     return get_active_course(cid)
 
 
-def list_courses() -> list[dict]:
+def list_courses(only_public: bool = False) -> list[dict]:
     init_db()
     with _conn() as conn:
-        rows = conn.execute(
-            "SELECT id, course_name, course_code, semester, default_class, pass_threshold, updated_at "
-            "FROM courses ORDER BY updated_at DESC, id DESC"
-        ).fetchall()
-    return [dict(r) for r in rows]
+        sql = (
+            "SELECT id, is_public, course_name, course_code, semester, default_class, "
+            "pass_threshold, updated_at FROM courses "
+        )
+        if only_public:
+            sql += "WHERE is_public = 1 "
+        sql += "ORDER BY is_public DESC, updated_at DESC, id DESC"
+        rows = conn.execute(sql).fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["is_public"] = bool(d["is_public"])
+        result.append(d)
+    return result
 
 
-def create_course(payload: dict) -> dict:
-    """新建一门课程配置。"""
+def create_course(payload: dict, is_public: bool = False) -> dict:
+    """新建一门课程配置或发布为公共课程规则模板。"""
     init_db()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     method = payload.get("method") or eng.METHOD
@@ -296,12 +416,14 @@ def create_course(payload: dict) -> dict:
         ensure_ascii=False,
     )
     meta = payload.get("meta") or {}
+    pub_flag = 1 if (is_public or payload.get("is_public")) else 0
     with _conn() as conn:
         cur = conn.execute(
             "INSERT INTO courses "
-            "(user_id, course_name, course_code, semester, default_class, pass_threshold, config_json, updated_at) "
-            "VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
+            "(user_id, is_public, course_name, course_code, semester, default_class, pass_threshold, config_json, updated_at) "
+            "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
+                pub_flag,
                 meta.get("课程名称") or "新课程",
                 meta.get("课程代码") or "",
                 meta.get("学期") or "2024-2025-1",
@@ -324,6 +446,10 @@ def delete_course(course_id: int):
         conn.execute("DELETE FROM class_reports WHERE course_id = ?", (course_id,))
         conn.execute("DELETE FROM courses WHERE id = ?", (course_id,))
 
+
+# ============================================================
+# 历史报告与全院监控
+# ============================================================
 
 def save_class_report(
     course_id: int,
@@ -398,7 +524,62 @@ def get_class_report(report_id: int) -> dict:
     return d
 
 
+def update_report_notes(report_id: int, notes: str):
+    init_db()
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE class_reports SET improvement_notes = ? WHERE id = ?",
+            (notes, report_id),
+        )
+
+
 def delete_class_report(report_id: int):
     init_db()
     with _conn() as conn:
         conn.execute("DELETE FROM class_reports WHERE id = ?", (report_id,))
+
+
+def get_college_overview() -> dict:
+    """管理员全院达成度汇总统计。"""
+    init_db()
+    users = list_users()
+    courses = list_courses()
+    reports = list_class_reports()
+
+    total_targets = 0
+    passed_targets = 0
+    unpassed_items = []
+    for rep in reports:
+        rep_detail = rep["report"].get("report", rep["report"])
+        for t_name, t_val in rep_detail.items():
+            if not isinstance(t_val, dict) or "达成度" not in t_val:
+                continue
+            total_targets += 1
+            ach = float(t_val["达成度"])
+            th = float(rep["pass_threshold"] or 0.65)
+            if ach >= th:
+                passed_targets += 1
+            else:
+                unpassed_items.append(
+                    {
+                        "report_id": rep["id"],
+                        "course_name": rep["course_name"],
+                        "semester": rep["semester"],
+                        "class_name": rep["class_name"],
+                        "target": t_name,
+                        "achievement": round(ach, 4),
+                        "threshold": th,
+                    }
+                )
+
+    return {
+        "teacher_count": sum(1 for u in users if u["role"] == "teacher"),
+        "public_template_count": sum(1 for c in courses if c["is_public"]),
+        "course_count": len(courses),
+        "report_count": len(reports),
+        "total_targets_evaluated": total_targets,
+        "passed_targets_count": passed_targets,
+        "overall_pass_rate": round(passed_targets / total_targets, 4) if total_targets else 0.0,
+        "unpassed_alerts": unpassed_items,
+        "recent_reports": reports[:10],
+    }
