@@ -17,8 +17,8 @@
   <section class="card">
     <h2><span class="step">1</span>成绩评定方法</h2>
     <div class="row">
-      <label>平时占比 <input id="dailyRatio" type="number" step="0.01" value="0.4"></label>
-      <label>期末占比 <input id="finalRatio" type="number" step="0.01" value="0.6"></label>
+      <label>平时占比 <input id="dailyRatio" type="number" step="0.01" value="0.4" onchange="setTotalRatio()"></label>
+      <label>期末占比 <input id="finalRatio" type="number" step="0.01" value="0.6" onchange="setTotalRatio()"></label>
     </div>
     <h3>平时环节（占比之和须为 1）</h3>
     <table id="dailyTable">
@@ -31,8 +31,18 @@
 
   <section class="card">
     <h2><span class="step">2</span>课程目标与考核环节对应关系</h2>
-    <p class="hint">填写大纲中各目标在各环节的原始比例，系统会自动列归一化。</p>
+    <p class="hint">
+      填写大纲中各目标在各环节的<b>相对比例</b>（不是占比，同一列加起来不必等于 1）。
+      系统按列归一化换算成实际分值，结果见下方预览。
+    </p>
     <div class="scroll"><table id="matrixTable"></table></div>
+    <p class="hint" id="matrixColSum"></p>
+
+    <h3>产出权重预览（系统自动计算）</h3>
+    <p class="hint">
+      产出权重 = 环节权重 × 该格比例 ÷ 该列比例之和。理论满分 = 该目标各环节产出权重之和 × 100。
+    </p>
+    <div class="scroll"><table id="outputTable"></table></div>
   </section>
 
   <section class="card">
@@ -58,6 +68,7 @@
       <label>期末小题成绩表 <input id="finalFile" type="file" accept=".xlsx"></label>
     </div>
     <button class="btn primary" onclick="calculate()">开始计算</button>
+    <button class="btn ghost" onclick="exportReport()">导出达成度计算表</button>
     <p class="hint" id="calcMsg"></p>
   </section>
 

@@ -91,3 +91,19 @@ td input { width: 70px; }
 }
 .badge.pass { background: #d1fae5; color: #065f46; }
 .badge.fail { background: #fee2e2; color: #991b1b; }
+
+/* 产出权重预览表 */
+#outputTable { margin-top: 6px; }
+#outputTable td:first-child { text-align: left; font-weight: 600; }
+#outputTable .sub-row td {
+  background: #f9fafb;
+  color: #6b7280;
+  font-size: 13px;
+  font-weight: 400;
+}
+#outputTable .sub-row td:first-child { font-weight: 400; }
+#outputTable .strong {
+  font-weight: 700;
+  color: #1d4ed8;
+  background: #eff6ff;
+}

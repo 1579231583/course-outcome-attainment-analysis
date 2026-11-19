@@ -31,11 +31,19 @@ function updateDailySum() {
   const el = document.getElementById("dailySum");
   el.textContent = `平时环节占比之和：${sum.toFixed(2)}`;
   el.className = "hint " + (Math.abs(sum - 1) < 1e-6 ? "ok" : "err");
+  renderOutputPreview();
 }
 
 function setDailyRatio(name, v) {
   CFG.method["平时环节"][name] = parseFloat(v) || 0;
   updateDailySum();
+}
+
+// 平时/期末总占比变化时，同步刷新环节权重预览
+function setTotalRatio() {
+  CFG.method["平时占比"] = parseFloat(document.getElementById("dailyRatio").value) || 0;
+  CFG.method["期末占比"] = parseFloat(document.getElementById("finalRatio").value) || 0;
+  renderOutputPreview();
 }
 
 function renameDaily(input, oldName) {
@@ -82,10 +90,79 @@ function renderMatrix() {
   });
   html += "</tbody>";
   t.innerHTML = html;
+  renderOutputPreview();
 }
 
 function setMatrix(tg, link, v) {
   CFG.matrix[tg][link] = parseFloat(v) || 0;
+  renderOutputPreview();
+}
+
+// 环节权重：平时各环节 = 平时占比 × 环节占比；期末 = 期末占比
+function calcLinkWeights() {
+  const w = {};
+  Object.entries(CFG.method["平时环节"]).forEach(([name, ratio]) => {
+    w[name] = (CFG.method["平时占比"] || 0) * (ratio || 0);
+  });
+  w["期末考试"] = CFG.method["期末占比"] || 0;
+  return w;
+}
+
+// 产出权重（列归一化）与理论满分，与后端 step2_output_weights 保持一致
+function calcOutputWeights() {
+  const links = [...Object.keys(CFG.method["平时环节"]), "期末考试"];
+  const targets = Object.keys(CFG.matrix);
+  const linkW = calcLinkWeights();
+  const output = {};
+  targets.forEach(t => { output[t] = {}; });
+
+  links.forEach(link => {
+    const colSum = targets.reduce((a, t) => a + (CFG.matrix[t][link] || 0), 0);
+    targets.forEach(t => {
+      const m = CFG.matrix[t][link] || 0;
+      output[t][link] = colSum > 0 ? linkW[link] * m / colSum : 0;
+    });
+  });
+
+  const full = {};
+  targets.forEach(t => {
+    full[t] = Object.values(output[t]).reduce((a, b) => a + b, 0) * 100;
+  });
+  return { links, targets, linkW, output, full };
+}
+
+function renderOutputPreview() {
+  const { links, targets, linkW, output, full } = calcOutputWeights();
+
+  // 列和提示：帮助教师理解“列和不必为 1”
+  const colSums = links.map(l =>
+    targets.reduce((a, t) => a + (CFG.matrix[t][l] || 0), 0)
+  );
+  const sumEl = document.getElementById("matrixColSum");
+  const bad = colSums.some(s => s <= 0);
+  sumEl.textContent = "各列比例之和：" +
+    links.map((l, i) => `${l} ${colSums[i].toFixed(2)}`).join("　") +
+    (bad ? "　（存在全 0 的列，该环节无法分配）" : "");
+  sumEl.className = "hint " + (bad ? "err" : "");
+
+  // 产出权重表
+  const t = document.getElementById("outputTable");
+  let html = "<thead><tr><th>课程目标</th>" +
+    links.map(l => `<th>${l}</th>`).join("") +
+    "<th>理论满分</th></tr></thead><tbody>";
+
+  // 环节权重行
+  html += "<tr class='sub-row'><td>环节权重（分）</td>" +
+    links.map(l => `<td>${(linkW[l] * 100).toFixed(2)}</td>`).join("") +
+    "<td>100.00</td></tr>";
+
+  targets.forEach(tg => {
+    html += `<tr><td>${tg}</td>` +
+      links.map(l => `<td>${output[tg][l].toFixed(2)}</td>`).join("") +
+      `<td class="strong">${full[tg].toFixed(2)}</td></tr>`;
+  });
+  html += "</tbody>";
+  t.innerHTML = html;
 }
 
 // ---------- 步骤 3：试卷结构 ----------
@@ -198,6 +275,41 @@ async function calculate() {
     msg.textContent = `计算完成：${data.student_count} 人`;
     msg.className = "hint ok";
     renderResult(data);
+  } catch (e) {
+    msg.textContent = e.message;
+    msg.className = "hint err";
+  }
+}
+
+async function exportReport() {
+  const df = document.getElementById("dailyFile").files[0];
+  const ff = document.getElementById("finalFile").files[0];
+  const msg = document.getElementById("calcMsg");
+  if (!df || !ff) {
+    msg.textContent = "请先选择两个成绩表";
+    msg.className = "hint err";
+    return;
+  }
+  const fd = new FormData();
+  fd.append("daily_file", df);
+  fd.append("final_file", ff);
+  msg.textContent = "正在生成…";
+  msg.className = "hint";
+  try {
+    const res = await fetch("/api/export", { method: "POST", body: fd });
+    if (!res.ok) {
+      const data = await res.json();
+      throw new Error(data.detail || "导出失败");
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "达成度计算表.xlsx";
+    a.click();
+    URL.revokeObjectURL(url);
+    msg.textContent = "已导出达成度计算表.xlsx";
+    msg.className = "hint ok";
   } catch (e) {
     msg.textContent = e.message;
     msg.className = "hint err";
