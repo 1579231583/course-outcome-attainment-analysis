@@ -1,15 +1,10 @@
-"""达成度计算引擎（配置驱动版）
+"""达成度计算引擎（无状态纯函数 + 配置驱动版）
 
 设计要点：
-- 试卷结构不再从 Excel 里解析，而是由系统配置（PAPER_STRUCTURE）提供
-- 教师上传的期末成绩表是简单结构：学号 | 姓名 | 第1题 | 第2题 | ...
-- 平时成绩表沿用原结构：学号 | 姓名 | 各平时环节
-- 支持两种工作模式：
-  1. 严格模式（load_daily_students + load_final_scores）：发现异常立即抛 ValueError
-  2. 预览纠错模式（parse_sheets_for_preview + calculate_from_records）：
-     返回列映射详情、全量学生数据及单元格级错误列表，供前端在线预览、双击纠错与实时重算
-
-运行：python backend/calc_engine.py
+- 所有核心计算与解析函数均支持显式传入 method / matrix / paper，不依赖进程级全局变量，
+  彻底杜绝多教师并发操作串数据（P0-1）。
+- 保留模块级默认配置（METHOD / MATRIX / PAPER_STRUCTURE），命令行直接运行
+  `python backend/calc_engine.py` 仍可一键跑通 44 人回归测试基准。
 """
 
 from pathlib import Path
@@ -20,26 +15,22 @@ ROOT = Path(__file__).resolve().parent.parent
 SAMPLE = ROOT / "示例"
 
 # ============================================================
-# 一、系统默认配置（对应网页端配置的内容）
+# 一、默认配置（仅用于初始化种子数据与命令行回归测试）
 # ============================================================
 
-# 0. 达成度合格阈值（默认 0.65，支持课程级自定义）
 PASS_THRESHOLD = 0.65
 
-# 1. 成绩评定方法：平时 40%（作业40/表现40/测验20），期末 60%
 METHOD = {
     "平时占比": 0.4,
     "期末占比": 0.6,
     "平时环节": {"作业": 0.4, "课堂表现": 0.4, "测验": 0.2},
 }
 
-# 2. 课程目标与考核环节对应关系（大纲原始比例）
 MATRIX = {
     "课程目标1": {"作业": 0.2, "课堂表现": 0.2, "测验": 0.1, "期末考试": 0.5},
     "课程目标2": {"作业": 0.4, "课堂表现": 0.3, "测验": 0.2, "期末考试": 0.1},
 }
 
-# 3. 试卷结构：大题 → 小题，每题满分 + 课程目标
 PAPER_STRUCTURE = [
     {"大题": "一、选择题", "小题": [
         {"题号": 1, "满分": 3, "目标": "课程目标1"},
@@ -102,7 +93,6 @@ def normalize(name):
     if not name:
         return ""
     s = str(name).replace("\xa0", "").replace(" ", "")
-    # 去掉括号及其内容，如 “作业（20%）” -> “作业”
     for left, right in (("（", "）"), ("(", ")")):
         while left in s and right in s:
             a, b = s.index(left), s.index(right)
@@ -114,10 +104,7 @@ def normalize(name):
 
 
 def find_header(rows, required):
-    """动态锚点扫描：找到同时包含所有 required 列名的行。
-
-    支持模糊匹配：列名归一化后包含关键字即视为命中。
-    """
+    """动态锚点扫描：找到同时包含所有 required 列名的行。"""
     for i, r in enumerate(rows):
         names = [clean(c) for c in r]
         normed = [normalize(c) for c in names]
@@ -127,24 +114,18 @@ def find_header(rows, required):
 
 
 def match_column(names, keyword, aliases=()):
-    """在表头中定位列：先精确匹配，再别名匹配，最后模糊包含匹配。
-
-    返回列索引，找不到返回 None。
-    """
+    """在表头中定位列：精确匹配 → 别名匹配 → 模糊包含匹配。"""
     normed = [normalize(n) for n in names]
     key = normalize(keyword)
 
-    # 1. 精确匹配
     if key in normed:
         return normed.index(key)
 
-    # 2. 别名匹配
     for alias in aliases:
         a = normalize(alias)
         if a in normed:
             return normed.index(a)
 
-    # 3. 模糊包含匹配（列名包含关键字，或关键字包含列名）
     for i, n in enumerate(normed):
         if n and (key in n or n in key):
             return i
@@ -152,11 +133,7 @@ def match_column(names, keyword, aliases=()):
 
 
 def build_column_mapping(names, fields, aliases_map=None):
-    """构建字段 -> 列索引的映射，返回 (mapping, missing)。
-
-    对应文档中的“列映射确认抽屉”：系统先自动匹配，
-    未识别的字段交给教师确认。
-    """
+    """构建字段 -> 列索引的映射，返回 (mapping, missing)。"""
     aliases_map = aliases_map or {}
     mapping, missing = {}, []
     for field in fields:
@@ -189,15 +166,28 @@ def extract_question_col_map(names):
 
 
 # ============================================================
-# 三、试卷结构校验与派生数据
+# 三、试卷结构校验与派生数据（纯函数，无全局依赖）
 # ============================================================
 
-def validate_structure():
+def paper_target_full(questions, matrix=None):
+    """试卷中各课程目标的卷面满分（包含卷面为 0 的目标键）。"""
+    mat = matrix if matrix is not None else MATRIX
+    result = {t: 0 for t in mat}
+    for q in questions:
+        result[q["目标"]] = result.get(q["目标"], 0) + q["满分"]
+    return result
+
+
+def validate_structure(method=None, matrix=None, paper=None):
     """校验试卷结构：总分 100、每题只归一个目标、题号连续、期末权重目标有题。"""
-    if not MATRIX:
+    m = method if method is not None else METHOD
+    mat = matrix if matrix is not None else MATRIX
+    p = paper if paper is not None else PAPER_STRUCTURE
+
+    if not mat:
         raise ValueError("课程目标矩阵不能为空")
 
-    questions = [q for g in PAPER_STRUCTURE for q in g["小题"]]
+    questions = [q for g in p for q in g.get("小题", [])]
     if not questions:
         raise ValueError("试卷结构不能为空，请至少配置一道小题")
 
@@ -209,18 +199,17 @@ def validate_structure():
     if numbers != list(range(1, len(numbers) + 1)):
         raise ValueError("题号必须从 1 连续编号")
 
-    targets = set(MATRIX.keys())
+    targets = set(mat.keys())
     for q in questions:
         if q["满分"] <= 0:
             raise ValueError(f"第{q['题号']}题满分必须大于 0")
         if q["目标"] not in targets:
             raise ValueError(f"第{q['题号']}题目标 {q['目标']} 无效")
 
-    # 检查：若某目标在矩阵中有期末考试权重（且期末总占比 > 0），试卷中必须至少有一道该目标的题
-    p_full = paper_target_full(questions)
-    if METHOD.get("期末占比", 0) > 0:
+    p_full = paper_target_full(questions, mat)
+    if m.get("期末占比", 0) > 0:
         for t in targets:
-            if MATRIX[t].get("期末考试", 0) > 0 and p_full.get(t, 0) <= 0:
+            if mat[t].get("期末考试", 0) > 0 and p_full.get(t, 0) <= 0:
                 raise ValueError(
                     f"「{t}」在对应关系矩阵中设有期末考试比例，但试卷中未分配任何属于该目标的小题"
                 )
@@ -228,47 +217,40 @@ def validate_structure():
     return questions
 
 
-def paper_target_full(questions):
-    """试卷中各课程目标的卷面满分（包含卷面为 0 的目标键）。"""
-    result = {t: 0 for t in MATRIX}
-    for q in questions:
-        result[q["目标"]] = result.get(q["目标"], 0) + q["满分"]
-    return result
-
-
 # ============================================================
-# 四、五步计算
+# 四、五步计算（纯函数，无全局依赖）
 # ============================================================
 
-def step1_link_weights():
+def step1_link_weights(method=None):
     """第一步：各环节在总成绩中的实际权重（分值比例 0~1）。"""
+    m = method if method is not None else METHOD
     weights = {
-        name: METHOD["平时占比"] * ratio
-        for name, ratio in METHOD["平时环节"].items()
+        name: m["平时占比"] * ratio
+        for name, ratio in m["平时环节"].items()
     }
-    weights["期末考试"] = METHOD["期末占比"]
+    weights["期末考试"] = m["期末占比"]
     return weights
 
 
-def step2_output_weights(link_weights):
+def step2_output_weights(link_weights, matrix=None):
     """第二步：产出权重（列归一化）与理论满分。"""
-    targets = list(MATRIX.keys())
+    mat = matrix if matrix is not None else MATRIX
+    targets = list(mat.keys())
     output = {t: {} for t in targets}
     for link, link_score in link_weights.items():
-        col_sum = sum(MATRIX[t].get(link, 0) for t in targets)
+        col_sum = sum(mat[t].get(link, 0) for t in targets)
         if link_score > 0 and col_sum <= 0:
             raise ValueError(
                 f"考核环节「{link}」在对应关系矩阵中的整列比例之和为 0，无法分配该环节权重"
             )
         for t in targets:
             output[t][link] = (
-                link_score * MATRIX[t].get(link, 0) / col_sum if col_sum > 0 else 0.0
+                link_score * mat[t].get(link, 0) / col_sum if col_sum > 0 else 0.0
             )
     full = {t: sum(output[t].values()) * 100 for t in targets}
     return output, full
 
 
-# 平时环节列名别名表：教师表里的常见写法
 DAILY_ALIASES = {
     "作业": ("平时作业", "作业成绩", "课后作业", "作业分"),
     "课堂表现": ("表现", "课堂", "平时表现", "课堂参与", "考勤", "出勤"),
@@ -276,24 +258,23 @@ DAILY_ALIASES = {
     "实验": ("实验成绩", "上机", "实践", "实验得分"),
 }
 
-# 统计行关键字：这些行不是学生数据
 STAT_KEYS = ("平均", "合计", "统计", "最高", "最低", "及格率", "标准差", "汇总", "人数")
 
 
 def _is_stat_row(sid, name):
-    """判断是否为末尾统计行或无效空行。"""
     if not sid or not name:
         return True
     s_sid, s_name = str(sid), str(name)
     return any(k in s_name or k in s_sid for k in STAT_KEYS)
 
 
-def load_daily_students(verbose=True):
-    """读取平时成绩表：学号 | 姓名 | 各平时环节（严格模式）。"""
-    rows = load_rows("平时成绩表.xlsx")
+def load_daily_students(verbose=True, rows=None, method=None):
+    """读取平时成绩表（严格模式）。"""
+    m = method if method is not None else METHOD
+    rows = rows if rows is not None else load_rows("平时成绩表.xlsx")
     idx, names = find_header(rows, ["学号", "姓名"])
 
-    fields = ["学号", "姓名"] + list(METHOD["平时环节"].keys())
+    fields = ["学号", "姓名"] + list(m["平时环节"].keys())
     mapping, missing = build_column_mapping(names, fields, DAILY_ALIASES)
     if missing:
         raise ValueError(
@@ -314,7 +295,7 @@ def load_daily_students(verbose=True):
             continue
 
         daily = {}
-        for link in METHOD["平时环节"]:
+        for link in m["平时环节"]:
             col_idx = mapping[link]
             v = to_num(r[col_idx]) if col_idx < len(r) else None
             if v is None:
@@ -333,9 +314,9 @@ def load_daily_students(verbose=True):
     return students
 
 
-def load_final_scores(students, questions):
-    """读取期末成绩表：学号 | 姓名 | 第1题 | 第2题 | ...（严格模式）。"""
-    rows = load_rows("期末小题成绩录入模板.xlsx")
+def load_final_scores(students, questions, rows=None):
+    """读取期末成绩表（严格模式）。"""
+    rows = rows if rows is not None else load_rows("期末小题成绩录入模板.xlsx")
     idx, names = find_header(rows, ["学号", "姓名"])
 
     base, missing_base = build_column_mapping(names, ["学号", "姓名"])
@@ -378,25 +359,23 @@ def load_final_scores(students, questions):
     return matched
 
 
-def step5_report(students, output, full, questions, threshold=None):
-    """第五步：汇总生成达成度报表。"""
-    if threshold is None:
-        threshold = PASS_THRESHOLD
-    targets = list(MATRIX.keys())
-    p_full = paper_target_full(questions)
+def step5_report(students, output, full, questions, method=None, matrix=None, threshold=None):
+    """第五步：汇总生成达成度报表（纯函数）。"""
+    m = method if method is not None else METHOD
+    mat = matrix if matrix is not None else MATRIX
+    th = float(threshold if threshold is not None else PASS_THRESHOLD)
+    targets = list(mat.keys())
+    p_full = paper_target_full(questions, mat)
     n = len(students)
     if n == 0:
         raise ValueError("有效学生人数为 0，无法计算达成度")
     result = {}
 
     for t in targets:
-        # 平时贡献：原始百分制分 × 产出权重
         daily = {
             link: sum(s["平时"][link] for s in students) / n * output[t][link]
-            for link in METHOD["平时环节"]
+            for link in m["平时环节"]
         }
-        # 期末贡献：该目标实得 / 该目标卷面满分 × 该目标期末设定分值
-        # 边界保护：若某目标不考期末（产出权重为 0 或卷面满分为 0），期末贡献为 0
         target_qs = [q["题号"] for q in questions if q["目标"] == t]
         if output[t].get("期末考试", 0) > 0 and p_full.get(t, 0) > 0 and target_qs:
             got_sum = sum(
@@ -420,13 +399,13 @@ def step5_report(students, output, full, questions, threshold=None):
             "实得": total,
             "理论满分": full[t],
             "达成度": ach,
-            "是否达标": ach >= threshold,
+            "是否达标": ach >= th,
         }
     return result
 
 
 # ============================================================
-# 五、预览与在线纠错模式（支撑列映射抽屉 + 表格标红就地编辑）
+# 五、预览与在线纠错模式（纯函数）
 # ============================================================
 
 def parse_sheets_for_preview(
@@ -434,19 +413,18 @@ def parse_sheets_for_preview(
     final_rows,
     custom_daily_map=None,
     custom_final_map=None,
+    method=None,
+    matrix=None,
+    paper=None,
 ):
-    """非阻断式解析平时成绩表与期末小题成绩表。
+    """非阻断式解析平时成绩表与期末小题成绩表。"""
+    m = method if method is not None else METHOD
+    mat = matrix if matrix is not None else MATRIX
+    p = paper if paper is not None else PAPER_STRUCTURE
 
-    返回：
-    - daily_meta: 平时表头、自动/自定义列映射、缺失字段、前5行预览
-    - final_meta: 期末表头、自动/自定义列映射、缺失题目列、前5行预览
-    - students: 合并后的学生列表 [{"学号", "姓名", "平时": {...}, "期末": {...}, "状态": ...}]
-    - errors: 结构化异常列表（精确到学号、字段、当前值、合法范围、错误类型）
-    """
-    questions = validate_structure()
-    daily_links = list(METHOD["平时环节"].keys())
+    questions = validate_structure(m, mat, p)
+    daily_links = list(m["平时环节"].keys())
 
-    # 1. 定位平时表头与列映射
     d_idx, d_names = find_header(daily_rows, ["学号", "姓名"])
     d_fields = ["学号", "姓名"] + daily_links
     d_map, d_missing = build_column_mapping(d_names, d_fields, DAILY_ALIASES)
@@ -457,7 +435,6 @@ def parse_sheets_for_preview(
                 if k in d_missing:
                     d_missing.remove(k)
 
-    # 2. 定位期末表头与列映射
     f_idx, f_names = find_header(final_rows, ["学号", "姓名"])
     f_base, f_missing_base = build_column_mapping(f_names, ["学号", "姓名"])
     f_qmap = extract_question_col_map(f_names)
@@ -469,7 +446,6 @@ def parse_sheets_for_preview(
                     if k in f_missing_base:
                         f_missing_base.remove(k)
                 else:
-                    # 题号映射，支持 "1" 或 "第1题"
                     qn = int(str(k).replace("第", "").replace("题", ""))
                     f_qmap[qn] = int(v)
 
@@ -502,7 +478,6 @@ def parse_sheets_for_preview(
     students = []
     by_id = {}
 
-    # 若核心列尚未映射全，先返回列映射信息让前端弹窗确认
     if d_missing or f_missing_base or f_missing_qs:
         if d_missing:
             errors.append({
@@ -525,7 +500,6 @@ def parse_sheets_for_preview(
             "errors": errors,
         }
 
-    # 3. 逐行解析平时成绩表
     seen_daily = set()
     for row_no, r in enumerate(daily_rows[d_idx + 1:], start=d_idx + 2):
         sid = clean(r[d_map["学号"]]) if d_map["学号"] < len(r) else None
@@ -586,7 +560,6 @@ def parse_sheets_for_preview(
         students.append(stu)
         by_id[sid] = stu
 
-    # 4. 逐行解析期末成绩表
     seen_final = set()
     extra_final_students = []
     for row_no, r in enumerate(final_rows[f_idx + 1:], start=f_idx + 2):
@@ -651,10 +624,8 @@ def parse_sheets_for_preview(
                 })
         stu["期末"] = got
 
-    # 5. 检查平时表有但期末表缺失的学生
     for stu in students:
         if stu["期末缺失"]:
-            # 默认用 None 占位，方便前端表格渲染与一键补 0 或剔除
             stu["期末"] = {q["题号"]: None for q in questions}
             errors.append({
                 "type": "missing_final",
@@ -676,12 +647,13 @@ def parse_sheets_for_preview(
     }
 
 
-def validate_and_normalize_records(students, questions):
+def validate_and_normalize_records(students, questions, method=None):
     """对前端传回的（已在线纠错的）学生 JSON 记录做最终校验并标准化键类型。"""
+    m = method if method is not None else METHOD
     if not students:
         raise ValueError("学生名单为空，无法计算")
 
-    daily_links = list(METHOD["平时环节"].keys())
+    daily_links = list(m["平时环节"].keys())
     normalized = []
     seen = set()
 
@@ -708,7 +680,6 @@ def validate_and_normalize_records(students, questions):
         final = {}
         for q in questions:
             qn = q["题号"]
-            # JSON 序列化后键可能是字符串 "1" 或整数 1
             raw_v = raw_final.get(qn, raw_final.get(str(qn)))
             v = to_num(raw_v)
             if v is None:
@@ -726,43 +697,17 @@ def validate_and_normalize_records(students, questions):
     return normalized
 
 
-# ============================================================
-# 六、命令行主流程（回归测试基准）
-# ============================================================
-
 def main():
     questions = validate_structure()
-    print(f"试卷结构校验通过：{len(questions)} 道小题，总分 "
-          f"{sum(q['满分'] for q in questions)}")
-
+    print(f"试卷结构校验通过：{len(questions)} 道小题，总分 {sum(q['满分'] for q in questions)}")
     link_weights = step1_link_weights()
     output, full = step2_output_weights(link_weights)
-
-    print("\n第一步 环节权重：", {k: round(v, 4) for k, v in link_weights.items()})
-    print("第二步 产出权重与理论满分：")
-    for t in output:
-        detail = ", ".join(f"{k}={v:.4f}" for k, v in output[t].items())
-        print(f"  {t}: {detail}")
-        print(f"    理论满分 = {full[t]:.2f}")
-
     students = load_daily_students()
-    print(f"\n平时成绩表：{len(students)} 人")
-
     matched = load_final_scores(students, questions)
-    print(f"期末成绩表：匹配 {matched} 人")
-    print(f"试卷各目标卷面满分：{paper_target_full(questions)}")
-
     report = step5_report(students, output, full, questions)
-
-    print("\n" + "=" * 62)
-    print("最终报表（全班均值）")
-    print("-" * 62)
+    print(f"学生数 {len(students)}，匹配 {matched}")
     for t, r in report.items():
-        detail = ", ".join(f"{k}={v:.2f}" for k, v in r["平时明细"].items())
-        print(f"{t}: 平时[{detail}] 期末={r['期末']:.2f}")
-        print(f"  实得={r['实得']:.2f} / 理论满分={r['理论满分']:.2f}"
-              f" → 达成度={r['达成度'] * 100:.1f}%")
-    print("=" * 62)
+        print(f"  {t}: 实得={r['实得']:.2f} / 满分={r['理论满分']:.2f} -> 达成度={r['达成度']*100:.1f}%")
 
 
 if __name__ == "__main__":

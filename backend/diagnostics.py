@@ -1,13 +1,7 @@
 """OBE 教学诊断下钻分析工具模块（为 OBE 诊断 Agent 预留 Tool-Calling 底层工具）
 
-包含 4 个直连真实数据的诊断工具：
-  1. analyze_weak_links          — 环节得分率下钻，定位拖累每个目标的薄弱考核环节
-  2. analyze_hard_questions      — 期末小题下钻，找出全班得分率最低的 Top N 难题
-  3. analyze_student_distribution — 全班学情分布画像（个人达标率、分段分布、平时高期末低反差生）
-  4. compare_with_history        — 调取同课程历史/平行班报告做横向对比
-
-同时提供 generate_diagnostic_report()，汇总 4 维真实指标并生成结构化中文诊断与持续改进草稿；
-后续接入大模型（DeepSeek / 通义千问 / OpenAI）时，可直接将这 4 个函数注册为 Agent Tools。
+输出分离的 analysis_text（达成情况分析）和 improvement_text（拟改进的措施），
+直接对应学校正式《目标达成评价表》底部两栏。
 """
 
 import db
@@ -15,7 +9,6 @@ import export_report
 
 
 def analyze_weak_links(report: dict, output_weights: dict) -> dict:
-    """工具 1：计算各目标下每个考核环节的得分率，找出最薄弱环节。"""
     result = {}
     for target, info in report.items():
         link_rates = []
@@ -51,7 +44,6 @@ def analyze_weak_links(report: dict, output_weights: dict) -> dict:
 
 
 def analyze_hard_questions(students: list[dict], questions: list[dict], top_n: int = 5) -> list[dict]:
-    """工具 2：下钻期末各小题，统计全班均分与得分率，按得分率从低到高排序。"""
     n = len(students)
     if n == 0 or not questions:
         return []
@@ -84,7 +76,6 @@ def analyze_student_distribution(
     paper_full: dict,
     threshold: float = 0.65,
 ) -> dict:
-    """工具 3：统计全班个人达成度分布与“平时高分但期末低分”反差学生数量。"""
     targets = list(output_weights.keys())
     all_links = list(output_weights[targets[0]].keys())
     daily_links = [l for l in all_links if l != "期末考试"]
@@ -93,7 +84,7 @@ def analyze_student_distribution(
         return {}
 
     per_target = {}
-    contrast_students = []  # 平时均分 >= 80 但期末卷面总分 < 60 的学生
+    contrast_students = []
 
     for s in students:
         d_avg = (
@@ -149,28 +140,30 @@ def analyze_student_distribution(
     }
 
 
-def compare_with_history(course_id: int, current_report: dict) -> list[dict]:
-    """工具 4：调取同课程历史/平行班报告做横向对比。"""
-    history = db.list_class_reports(course_id=course_id)
+def compare_with_history(user_id: int, role: str, course_id: int) -> list[dict]:
+    history = db.list_class_reports(user_id, role, course_id=course_id)
     comparisons = []
     for h in history[:5]:
         h_rep = h["report"].get("report", h["report"])
-        row = {
-            "report_id": h["id"],
-            "班级": h["class_name"],
-            "学期": h["semester"],
-            "人数": h["student_count"],
-            "各目标达成度": {
-                t: round(v["达成度"], 4)
-                for t, v in h_rep.items()
-                if isinstance(v, dict) and "达成度" in v
-            },
-        }
-        comparisons.append(row)
+        comparisons.append(
+            {
+                "report_id": h["id"],
+                "班级": h["class_name"],
+                "学期": h["semester"],
+                "人数": h["student_count"],
+                "各目标达成度": {
+                    t: round(v["达成度"], 4)
+                    for t, v in h_rep.items()
+                    if isinstance(v, dict) and "达成度" in v
+                },
+            }
+        )
     return comparisons
 
 
 def generate_diagnostic_report(
+    user_id: int,
+    role: str,
     course_id: int,
     meta: dict,
     students: list[dict],
@@ -181,38 +174,29 @@ def generate_diagnostic_report(
     paper_full: dict,
     threshold: float = 0.65,
 ) -> dict:
-    """汇总 4 维下钻诊断工具输出，并自动生成 OBE 持续改进建议草稿。"""
     weak_links = analyze_weak_links(report, output_weights)
     hard_questions = analyze_hard_questions(students, questions, top_n=5)
     distribution = analyze_student_distribution(
         students, output_weights, full_scores, questions, paper_full, threshold
     )
-    history_cmp = compare_with_history(course_id, report)
+    history_cmp = compare_with_history(user_id, role, course_id)
 
-    # 拼装专业、有数据支撑的中文诊断与持续改进草稿
-    lines = [
-        f"【{meta.get('课程名称', '本课程')} · {meta.get('班级', '')} 课程目标达成情况诊断】",
-        f"本次评价有效样本 {len(students)} 人，合格基准线为 {threshold * 100:.0f}%。",
+    analysis_lines = [
+        f"本学期《{meta.get('课程名称', '本课程')}》（{meta.get('班级', '')}）共评价有效样本 {len(students)} 人，合格基准线为 {threshold * 100:.0f}%。"
     ]
-
     unpassed_targets = []
     for t, info in weak_links.items():
-        status = "达标" if info["是否达标"] else "未达标（需重点改进）"
+        status = "达标" if info["是否达标"] else "未达标"
         wl = info["最薄弱环节"]
-        wl_desc = (
-            f"最薄弱环节为「{wl['环节']}」（得分率 {wl['得分率'] * 100:.1f}%）"
-            if wl
-            else ""
-        )
+        wl_desc = f"，最薄弱环节为「{wl['环节']}」（得分率 {wl['得分率'] * 100:.1f}%）" if wl else ""
         dist_t = distribution.get("各目标分布", {}).get(t, {})
         pass_rate_str = (
-            f"，个人达标率 {dist_t.get('个人达标率', 0) * 100:.1f}%"
-            f"（{dist_t.get('达标人数', 0)}/{len(students)} 人）"
+            f"，个人达标率 {dist_t.get('个人达标率', 0) * 100:.1f}%（{dist_t.get('达标人数', 0)}/{len(students)} 人）"
             if dist_t
             else ""
         )
-        lines.append(
-            f"- {t}：达成度 {info['达成度'] * 100:.1f}%（{status}）{pass_rate_str}；{wl_desc}。"
+        analysis_lines.append(
+            f"{t}达成度为 {info['达成度'] * 100:.1f}%（{status}）{pass_rate_str}{wl_desc}。"
         )
         if not info["是否达标"]:
             unpassed_targets.append(t)
@@ -223,27 +207,29 @@ def generate_diagnostic_report(
             f"第{q['题号']}题（{q['所属目标']}，均分 {q['全班均分']}/{q['满分']:g}，得分率 {q['得分率'] * 100:.1f}%）"
             for q in top3
         )
-        lines.append(f"\n【期末试题薄弱点下钻】全班得分率最低的 3 道小题为：{q_str}。")
+        analysis_lines.append(f"从期末试题下钻来看，得分率最低的 3 道小题依次为：{q_str}。")
 
     contrast_cnt = distribution.get("平时高期末低反差人数", 0)
     if contrast_cnt > 0:
-        lines.append(
-            f"【学情预警】共有 {contrast_cnt} 名学生呈现“平时均分 ≥ 80 分但期末卷面 < 60 分”的反差现象，"
-            "建议加强过程性作业/测验的独立性核查与考前综合训练。"
+        analysis_lines.append(
+            f"此外，共有 {contrast_cnt} 名学生呈现“平时均分 ≥ 80 分但期末卷面 < 60 分”的反差，说明部分学生平时作业独立完成度不足、综合应试训练薄弱。"
         )
 
-    lines.append("\n【持续改进措施建议】")
+    imp_lines = []
     if unpassed_targets:
-        lines.append(
-            f"1. 针对未达标的 {'、'.join(unpassed_targets)}，下学期需结合上述低得分率题型（如第"
+        imp_lines.append(
+            f"1. 针对未达标的 {'、'.join(unpassed_targets)}，下学期将结合低得分率题型（如第"
             + "、".join(str(q["题号"]) for q in hard_questions[:2])
-            + "题）增加课堂例题拆解与阶段性小测验覆盖；"
+            + "题对应知识点）加强课堂板书例题拆解，并在阶段测验中增加变式综合训练；"
         )
     else:
-        lines.append("1. 本次各课程目标均已达标，建议继续巩固现有过程考核节奏，针对得分率相对较低的小题进一步优化习题梯度；")
-    lines.append(
-        "2. 对未达标学生群体建立期中预警与课后答疑跟踪机制，缩小平时成绩与期末闭卷考试之间的能力落差。"
+        imp_lines.append("1. 本次各课程目标均已达标，下学期继续保持过程考核节奏，针对得分率相对偏低的综合题型进一步优化阶梯训练；")
+    imp_lines.append(
+        "2. 强化过程性评价的真实性与区分度，将部分课后作业转化为随堂限时练习，减少抄袭现象，并对期中预警学生开展针对性答疑辅导。"
     )
+
+    analysis_text = "\n".join(analysis_lines)
+    improvement_text = "\n".join(imp_lines)
 
     return {
         "mode": "rule_agent_v1",
@@ -251,5 +237,7 @@ def generate_diagnostic_report(
         "hard_questions": hard_questions,
         "distribution": distribution,
         "history_comparison": history_cmp,
-        "draft_text": "\n".join(lines),
+        "analysis_text": analysis_text,
+        "improvement_text": improvement_text,
+        "draft_text": f"【达成情况分析】\n{analysis_text}\n\n【拟改进的措施】\n{improvement_text}",
     }

@@ -30,3 +30,25 @@ htmlcov/
 # IDE settings
 .vscode/
 .idea/
+
+# Node / Vue / Vite frontend
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.local
+
+# SQLite runtime files
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Office / openpyxl / tool temp files
+~$*.xlsx
+~$*.xls
+openpyxl.*
+.trae-html-share-packages/
+
+# OS files
+.DS_Store
+Thumbs.db
