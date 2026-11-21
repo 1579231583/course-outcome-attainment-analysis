@@ -16,10 +16,6 @@
   <img src="https://img.shields.io/badge/Status-Active%20Development-2563EB?style=flat-square&logo=githubactions&logoColor=white" alt="Status" />
 </p>
 
-<a href="https://star-history.com/#1579231583/course-outcome-attainment-analysis&Date">
-  <img src="https://api.star-history.com/svg?repos=1579231583/course-outcome-attainment-analysis&type=Date" alt="Star History Chart" width="600" />
-</a>
-
 <p>
   <a href="#-核心特性">核心特性</a> •
   <a href="#-系统架构">系统架构</a> •
@@ -201,3 +197,7 @@ course-outcome-attainment-analysis/
 - 🧮 [达成度计算流程指南](docs/达成度计算流程.md) — 五步算法详解与 44 人 / 单学生验算过程
 - 🏛️ [项目技术文档](docs/项目文档.md) — 技术栈、数据库设计与接口说明
 - 📋 [开发流程与进度日志](docs/开发流程.md) — 阶段规划与迭代记录
+
+<a href="https://star-history.com/#1579231583/course-outcome-attainment-analysis&Date">
+  <img src="https://api.star-history.com/svg?repos=1579231583/course-outcome-attainment-analysis&type=Date" alt="Star History Chart" width="600" />
+</a>
