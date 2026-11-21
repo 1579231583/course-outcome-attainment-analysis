@@ -16,6 +16,10 @@
   <img src="https://img.shields.io/badge/Status-Active%20Development-2563EB?style=flat-square&logo=githubactions&logoColor=white" alt="Status" />
 </p>
 
+<a href="https://star-history.com/#1579231583/course-outcome-attainment-analysis&Date">
+  <img src="https://api.star-history.com/svg?repos=1579231583/course-outcome-attainment-analysis&type=Date" alt="Star History Chart" width="600" />
+</a>
+
 <p>
   <a href="#-核心特性">核心特性</a> •
   <a href="#-系统架构">系统架构</a> •

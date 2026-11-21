@@ -277,8 +277,10 @@ def _cell_a(row):
     return eng.clean(row[0]) if row else None
 
 
-def _is_course_sheet(rows) -> bool:
-    return any((_cell_a(r) or "").find(SEC1) >= 0 for r in rows)
+def _is_course_sheet(title: str, rows) -> bool:
+    if "说明" in (title or ""):
+        return False
+    return any((_cell_a(r) or "").startswith("一、") and SEC1 in (_cell_a(r) or "") for r in rows)
 
 
 def _parse_course_sheet(rows) -> dict:
@@ -482,7 +484,7 @@ def parse_config_workbook_detailed(path: Path) -> list[dict]:
     results = []
     for ws in wb.worksheets:
         rows = [list(r) for r in ws.iter_rows(values_only=True)]
-        if not _is_course_sheet(rows):
+        if not _is_course_sheet(ws.title, rows):
             continue
         try:
             results.append({"sheet": ws.title, "course": _parse_course_sheet(rows), "error": None})
