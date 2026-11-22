@@ -449,24 +449,29 @@ def list_courses_for_user(user_id: int, role: str, only_public: bool = False) ->
         if only_public:
             rows = conn.execute(
                 "SELECT id, user_id, is_public, course_name, course_code, semester, default_class, "
-                "pass_threshold, updated_at FROM courses WHERE is_public = 1 ORDER BY updated_at DESC, id DESC"
+                "pass_threshold, config_json, updated_at FROM courses WHERE is_public = 1 ORDER BY updated_at DESC, id DESC"
             ).fetchall()
         elif role == "admin":
             rows = conn.execute(
                 "SELECT id, user_id, is_public, course_name, course_code, semester, default_class, "
-                "pass_threshold, updated_at FROM courses ORDER BY is_public DESC, updated_at DESC, id DESC"
+                "pass_threshold, config_json, updated_at FROM courses ORDER BY is_public DESC, updated_at DESC, id DESC"
             ).fetchall()
         else:
             rows = conn.execute(
                 "SELECT id, user_id, is_public, course_name, course_code, semester, default_class, "
-                "pass_threshold, updated_at FROM courses WHERE user_id = ? OR is_public = 1 "
+                "pass_threshold, config_json, updated_at FROM courses WHERE user_id = ? OR is_public = 1 "
                 "ORDER BY is_public ASC, updated_at DESC, id DESC",
                 (user_id,),
             ).fetchall()
     result = []
     for r in rows:
         d = dict(r)
+        cfg = json.loads(d.pop("config_json"))
+        qs = [q for g in cfg.get("paper") or [] for q in g.get("小题") or []]
+        p_total = sum(float(q.get("满分") or 0) for q in qs)
         d["is_public"] = bool(d["is_public"])
+        d["question_count"] = len(qs)
+        d["has_paper"] = len(qs) > 0 and abs(p_total - 100) < 1e-6
         result.append(d)
     return result
 
@@ -477,9 +482,9 @@ def create_course(payload: dict, user_id: int, is_public: bool = False, teacher_
     meta = payload.get("meta") or {}
     cfg_json = json.dumps(
         {
-            "method": payload.get("method") or eng.METHOD,
-            "matrix": payload.get("matrix") or eng.MATRIX,
-            "paper": payload.get("paper") or eng.PAPER_STRUCTURE,
+            "method": payload["method"] if "method" in payload else eng.METHOD,
+            "matrix": payload["matrix"] if "matrix" in payload else eng.MATRIX,
+            "paper": payload["paper"] if "paper" in payload else eng.PAPER_STRUCTURE,
             "target_descriptions": payload.get("target_descriptions") or {},
             "meta_ext": {
                 "任课教师": meta.get("任课教师") or teacher_name,

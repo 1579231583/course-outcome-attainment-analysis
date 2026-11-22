@@ -21,6 +21,9 @@
           >
             <strong>{{ tpl.course_name }}</strong>
             <span>{{ tpl.semester }}</span>
+            <el-tag :type="tpl.has_paper ? 'success' : 'warning'" size="small" effect="plain">
+              {{ tpl.has_paper ? '含试卷' : '仅大纲' }}
+            </el-tag>
           </div>
         </div>
       </div>
@@ -323,6 +326,17 @@
             <el-tag v-for="t in targetList" :key="t" size="small" effect="plain">
               {{ t }} 卷面 {{ paperTargetFull[t] || 0 }} 分
             </el-tag>
+            <el-button size="small" plain @click="downloadMyPaperTpl">下载4列试卷模板</el-button>
+            <input
+              ref="paperFileRef"
+              type="file"
+              accept=".xlsx"
+              style="display: none"
+              @change="uploadMyPaperExcel"
+            />
+            <el-button size="small" type="success" plain @click="paperFileRef?.click()">
+              上传试卷模板导入
+            </el-button>
             <el-button size="small" type="primary" plain @click="addGroup">+ 添加大题</el-button>
           </div>
         </div>
@@ -435,6 +449,7 @@ const newLinkName = ref('')
 const newTargetName = ref('')
 const showDetailWeights = ref(false)
 const showExtMeta = ref(false)
+const paperFileRef = ref(null)
 const expandedGroups = ref([]) // 默认全部收起大题，极致清爽！
 const publicTemplates = ref([])
 const batch = reactive({ count: 5, score: 3, target: '' })
@@ -614,6 +629,29 @@ async function saveAndJumpUpload() {
     ElMessage.error(e.message)
   } finally {
     saving.value = false
+  }
+}
+
+async function downloadMyPaperTpl() {
+  try {
+    await api.downloadPaperTemplate(props.cfg.course_id, props.cfg.meta['课程名称'] || '课程')
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
+
+async function uploadMyPaperExcel(e) {
+  const file = e.target.files?.[0]
+  if (!file) return
+  try {
+    const res = await api.importPaperExcel(props.cfg.course_id, file)
+    props.cfg.paper = res.paper
+    ElMessage.success(res.message)
+    if (res.cloned && res.course_id) emit('reload-config', res.course_id)
+  } catch (err) {
+    ElMessage.error(err.message)
+  } finally {
+    if (paperFileRef.value) paperFileRef.value.value = ''
   }
 }
 

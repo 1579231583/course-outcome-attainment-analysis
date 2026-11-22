@@ -19,6 +19,7 @@ from pathlib import Path
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
 
 import calc_engine as eng
 
@@ -283,7 +284,50 @@ def _is_course_sheet(title: str, rows) -> bool:
     return any((_cell_a(r) or "").startswith("一、") and SEC1 in (_cell_a(r) or "") for r in rows)
 
 
-def _parse_course_sheet(rows) -> dict:
+def _collect_course_errors(course: dict, allow_empty_paper: bool = False) -> list[str]:
+    """对提取出的课程结构做非阻断式完整规则校验，返回错误列表（供前端实时预览与在线修改）。"""
+    errs = []
+    meta = course.get("meta") or {}
+    method = course.get("method") or {}
+    matrix = course.get("matrix") or {}
+    paper = course.get("paper") or []
+
+    if not (meta.get("课程名称") or "").strip():
+        errs.append("课程名称不能为空")
+    d_r = float(method.get("平时占比") or 0)
+    f_r = float(method.get("期末占比") or 0)
+    if abs(d_r + f_r - 1.0) > 1e-6:
+        errs.append(f"平时占比({d_r:g}) + 期末占比({f_r:g}) 之和为 {d_r + f_r:g}，须等于 1")
+
+    d_links = method.get("平时环节") or {}
+    if not d_links:
+        errs.append("至少需保留 1 个平时环节")
+    else:
+        d_sum = sum(float(v or 0) for v in d_links.values())
+        if abs(d_sum - 1.0) > 1e-6:
+            errs.append(f"平时各环节比例之和为 {d_sum:.2f}，须等于 1")
+
+    if not matrix:
+        errs.append("至少需配置 1 个课程目标")
+    else:
+        try:
+            lw = eng.step1_link_weights(method)
+            eng.step2_output_weights(lw, matrix)
+        except ValueError as e:
+            errs.append(str(e))
+
+    # 若允许仅大纲入库且尚未配置试卷，则跳过试卷结构校验
+    has_qs = any(g.get("小题") for g in paper)
+    if has_qs or not allow_empty_paper:
+        try:
+            eng.validate_structure(method, matrix, paper)
+        except ValueError as e:
+            errs.append(str(e))
+
+    return errs
+
+
+def _parse_course_sheet(rows, strict: bool = True) -> dict:
     marks = {}
     for i, r in enumerate(rows):
         a = _cell_a(r) or ""
@@ -309,13 +353,16 @@ def _parse_course_sheet(rows) -> dict:
         if k and k != "配置项":
             kv[k] = r[1] if len(r) > 1 else None
 
-    cname = eng.clean(kv.get("课程名称"))
-    if not cname:
+    cname = eng.clean(kv.get("课程名称")) or ""
+    if strict and not cname:
         raise ValueError("课程名称不能为空")
-    daily_ratio, final_ratio = eng.to_num(kv.get("平时占比")), eng.to_num(kv.get("期末占比"))
-    if daily_ratio is None or final_ratio is None:
+    daily_ratio = eng.to_num(kv.get("平时占比"))
+    final_ratio = eng.to_num(kv.get("期末占比"))
+    if strict and (daily_ratio is None or final_ratio is None):
         raise ValueError("请填写平时占比和期末占比")
-    if abs(daily_ratio + final_ratio - 1) > 1e-6:
+    daily_ratio = daily_ratio if daily_ratio is not None else 0.4
+    final_ratio = final_ratio if final_ratio is not None else 0.6
+    if strict and abs(daily_ratio + final_ratio - 1) > 1e-6:
         raise ValueError(f"平时占比({daily_ratio:g}) + 期末占比({final_ratio:g}) 必须等于 1")
 
     # 二、平时环节
@@ -325,12 +372,12 @@ def _parse_course_sheet(rows) -> dict:
         if not k or k == "环节名称":
             continue
         v = eng.to_num(r[1] if len(r) > 1 else None)
-        if v is None or v < 0:
+        if strict and (v is None or v < 0):
             raise ValueError(f"平时环节「{k}」的比例无效")
-        daily_links[k] = v
-    if not daily_links:
+        daily_links[k] = v if (v is not None and v >= 0) else 0.0
+    if strict and not daily_links:
         raise ValueError("请至少填写一个平时环节")
-    if abs(sum(daily_links.values()) - 1) > 1e-6:
+    if strict and abs(sum(daily_links.values()) - 1) > 1e-6:
         raise ValueError(f"平时环节比例之和须为 1，当前为 {sum(daily_links.values()):.2f}")
 
     # 三、对应矩阵
@@ -342,8 +389,10 @@ def _parse_course_sheet(rows) -> dict:
     for l in list(daily_links) + ["期末考试"]:
         idx = eng.match_column(h3, l)
         if idx is None or idx < 2:
-            raise ValueError(f"对应矩阵缺少环节列「{l}」（须与平时环节名称一致）")
-        link_cols[l] = idx
+            if strict:
+                raise ValueError(f"对应矩阵缺少环节列「{l}」（须与平时环节名称一致）")
+        else:
+            link_cols[l] = idx
     desc_col = eng.match_column(h3, "目标说明")
     matrix, descs = {}, {}
     for r in block3[1:]:
@@ -351,12 +400,16 @@ def _parse_course_sheet(rows) -> dict:
         if not tg:
             continue
         matrix[tg] = {
-            l: (eng.to_num(r[ci]) if ci < len(r) and eng.to_num(r[ci]) is not None else 0.0)
-            for l, ci in link_cols.items()
+            l: (
+                eng.to_num(r[link_cols[l]])
+                if (l in link_cols and link_cols[l] < len(r) and eng.to_num(r[link_cols[l]]) is not None)
+                else 0.0
+            )
+            for l in list(daily_links) + ["期末考试"]
         }
         if desc_col is not None and desc_col < len(r):
             descs[tg] = eng.clean(r[desc_col]) or ""
-    if not matrix:
+    if strict and not matrix:
         raise ValueError("请至少填写一个课程目标")
 
     # 四、试卷结构
@@ -364,16 +417,20 @@ def _parse_course_sheet(rows) -> dict:
     if not block4 or _cell_a(block4[0]) != "大题名称":
         raise ValueError("期末试卷结构区块缺少表头行（第一列应为“大题名称”）")
     order, groups, seq = [], {}, 1
+    default_tg = next(iter(matrix.keys()), "课程目标1")
     for r in block4[1:]:
         grp = _cell_a(r)
         full_s = eng.to_num(r[2]) if len(r) > 2 else None
         tg = eng.clean(r[3]) if len(r) > 3 else None
         if not grp and full_s is None and not tg:
             continue
-        if not grp or full_s is None or not tg:
+        if strict and (not grp or full_s is None or not tg):
             raise ValueError(f"期末试卷第 {seq} 题信息不完整（需填大题名称、小题满分、所属课程目标）")
-        if tg not in matrix:
+        if strict and tg not in matrix:
             raise ValueError(f"期末试卷第 {seq} 题的目标「{tg}」不在对应矩阵中")
+        grp = grp or "未命名大题"
+        full_s = full_s if (full_s is not None and full_s > 0) else 5.0
+        tg = tg if (tg and tg in matrix) else default_tg
         if grp not in groups:
             order.append(grp)
             groups[grp] = []
@@ -382,13 +439,14 @@ def _parse_course_sheet(rows) -> dict:
     paper = [{"大题": g, "小题": groups[g]} for g in order]
 
     method = {"平时占比": daily_ratio, "期末占比": final_ratio, "平时环节": daily_links}
-    eng.validate_structure(method, matrix, paper)
-    eng.step2_output_weights(eng.step1_link_weights(method), matrix)
+    if strict:
+        eng.validate_structure(method, matrix, paper)
+        eng.step2_output_weights(eng.step1_link_weights(method), matrix)
 
     th = eng.to_num(kv.get("合格阈值"))
     return {
         "meta": {
-            "课程名称": cname,
+            "课程名称": cname or "未命名课程",
             "课程代码": eng.clean(kv.get("课程代码")) or "",
             "学期": eng.clean(kv.get("开课学期")) or "2024-2025-1",
             "班级": eng.clean(kv.get("默认班级")) or "",
@@ -475,10 +533,9 @@ def _parse_legacy_vertical(wb) -> dict:
 # 对外接口
 # ============================================================
 
-def parse_config_workbook_detailed(path: Path) -> list[dict]:
-    """逐门解析，返回 [{"sheet": 工作表名, "course": dict|None, "error": str|None}]。
-
-    单门课程出错不影响其他课程。
+def parse_config_workbook_for_preview(path: Path) -> list[dict]:
+    """非阻断式预览解析：即使某门课比例和 ≠ 1 或试卷总分 ≠ 100，也完整提取出 course 结构与 errors 列表，
+    供管理员在网页上实时预览、直接修改配平后再一键批量入库发布！
     """
     wb = openpyxl.load_workbook(path, data_only=True)
     results = []
@@ -487,9 +544,20 @@ def parse_config_workbook_detailed(path: Path) -> list[dict]:
         if not _is_course_sheet(ws.title, rows):
             continue
         try:
-            results.append({"sheet": ws.title, "course": _parse_course_sheet(rows), "error": None})
+            course = _parse_course_sheet(rows, strict=False)
+            errs = _collect_course_errors(course)
+            results.append(
+                {
+                    "sheet": ws.title,
+                    "course": course,
+                    "errors": errs,
+                    "error": "；".join(errs) if errs else None,
+                }
+            )
         except ValueError as e:
-            results.append({"sheet": ws.title, "course": None, "error": str(e)})
+            results.append(
+                {"sheet": ws.title, "course": None, "errors": [str(e)], "error": str(e)}
+            )
 
     if results:
         return results
@@ -497,11 +565,39 @@ def parse_config_workbook_detailed(path: Path) -> list[dict]:
     first = eng.clean(wb.worksheets[0].cell(1, 1).value) if wb.worksheets else None
     if first == "配置项" and len(wb.sheetnames) >= 3:
         try:
-            return [{"sheet": wb.sheetnames[0], "course": _parse_legacy_vertical(wb), "error": None}]
+            c = _parse_legacy_vertical(wb)
+            errs = _collect_course_errors(c)
+            return [
+                {
+                    "sheet": wb.sheetnames[0],
+                    "course": c,
+                    "errors": errs,
+                    "error": "；".join(errs) if errs else None,
+                }
+            ]
         except Exception as e:
-            return [{"sheet": wb.sheetnames[0], "course": None, "error": f"旧版格式解析失败：{e}"}]
+            return [
+                {
+                    "sheet": wb.sheetnames[0],
+                    "course": None,
+                    "errors": [f"旧版格式解析失败：{e}"],
+                    "error": f"旧版格式解析失败：{e}",
+                }
+            ]
 
     raise ValueError("未识别到课程配置：请使用系统下载的《课程规则配置模板.xlsx》（每个工作表需包含“一、课程基本信息”等四个区块）")
+
+
+def parse_config_workbook_detailed(path: Path) -> list[dict]:
+    """逐门解析，返回 [{"sheet": 工作表名, "course": dict|None, "error": str|None}]。"""
+    items = parse_config_workbook_for_preview(path)
+    out = []
+    for it in items:
+        if it["error"]:
+            out.append({"sheet": it["sheet"], "course": None, "error": it["error"]})
+        else:
+            out.append({"sheet": it["sheet"], "course": it["course"], "error": None})
+    return out
 
 
 def parse_multi_course_config_excel(path: Path) -> list[dict]:
@@ -516,3 +612,243 @@ def parse_multi_course_config_excel(path: Path) -> list[dict]:
 def parse_course_config_excel(path: Path) -> dict:
     """兼容单课程调用：返回第一门课程。"""
     return parse_multi_course_config_excel(path)[0]
+
+
+# ============================================================
+# 专门的 4 列《期末试卷结构模板.xlsx》生成与解析
+# ============================================================
+
+def build_paper_structure_template(
+    course_name: str,
+    targets: list[str],
+    existing_paper: list | None = None,
+) -> io.BytesIO:
+    """生成极度顺手的 4 列《期末试卷结构模板.xlsx》：
+    - 每个大题之间预留 2 行空行，方便直接增删小题；
+    - 同一大题下只需在首行写大题名称，下方小题第 1 列可留空（系统自动向下继承）；
+    - 第 4 列「所属课程目标」内置 Excel 下拉选择框；
+    - 底部自带「试卷总分合计 =SUM(...)」实时核对总分是否等于 100。
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "期末试卷结构"
+
+    ws.merge_cells("A1:D1")
+    t = ws.cell(1, 1, f"《{course_name}》期末试卷结构配置模板")
+    t.font = Font(size=14, bold=True)
+    t.alignment = CENTER
+    ws.row_dimensions[1].height = 28
+
+    ws.merge_cells("A2:D2")
+    tip = ws.cell(
+        2,
+        1,
+        f"填写说明：① 每大题间已空出预留行，可直接增删小题；② 同一大题名称只需在首行填一次（下方可留空）；"
+        f"③ 所属课程目标可直接下拉选择【{' / '.join(targets)}】；④ 底部总分合计凑满 100 分即可上传。",
+    )
+    tip.fill = TIP_FILL
+    tip.alignment = LEFT
+    ws.row_dimensions[2].height = 38
+
+    _header(ws, 3, ["大题名称", "题号", "小题满分", "所属课程目标"])
+    ws.row_dimensions[3].height = 24
+
+    # 组织大题分组
+    if existing_paper and any(g.get("小题") for g in existing_paper):
+        groups = existing_paper
+    else:
+        t1 = targets[0] if targets else "课程目标1"
+        t2 = targets[1] if len(targets) > 1 else t1
+        groups = [
+            {"大题": "一、选择题", "小题": [
+                {"题号": 1, "满分": 5, "目标": t1},
+                {"题号": 2, "满分": 5, "目标": t1},
+                {"题号": 3, "满分": 5, "目标": t2},
+                {"题号": 4, "满分": 5, "目标": t2},
+            ]},
+            {"大题": "二、填空题", "小题": [
+                {"题号": 5, "满分": 10, "目标": t1},
+                {"题号": 6, "满分": 10, "目标": t2},
+            ]},
+            {"大题": "三、计算与解答题", "小题": [
+                {"题号": 7, "满分": 20, "目标": t1},
+                {"题号": 8, "满分": 20, "目标": t1},
+                {"题号": 9, "满分": 20, "目标": t2},
+            ]},
+        ]
+
+    cur_row = 4
+    first_data_row = cur_row
+    for g_idx, grp in enumerate(groups):
+        qs = grp.get("小题") or []
+        for i, q in enumerate(qs):
+            # 同一大题下，大题名称只在第一行显示，后续行留空更清爽
+            grp_label = grp["大题"] if i == 0 else None
+            _row(ws, cur_row, [grp_label, q.get("题号"), q.get("满分"), q.get("目标")])
+            if i == 0:
+                ws.cell(cur_row, 1).font = Font(bold=True)
+            ws.row_dimensions[cur_row].height = 22
+            cur_row += 1
+        # 每个大题之间预留 2 行空白带边框编辑行，方便老师直接增题
+        for _ in range(2):
+            _row(ws, cur_row, [None, None, None, None])
+            ws.row_dimensions[cur_row].height = 20
+            cur_row += 1
+
+    last_data_row = cur_row - 1
+
+    # 底部实时总分合计行
+    sum_row = cur_row
+    ws.merge_cells(start_row=sum_row, start_column=1, end_row=sum_row, end_column=2)
+    c_lbl = ws.cell(sum_row, 1, "试卷总分合计（须为 100）")
+    c_lbl.font = Font(bold=True)
+    c_lbl.alignment = CENTER
+    c_lbl.fill = HEAD_FILL
+    ws.cell(sum_row, 1).border = BORDER
+    ws.cell(sum_row, 2).border = BORDER
+
+    c_sum = ws.cell(sum_row, 3, f"=SUM(C{first_data_row}:C{last_data_row})")
+    c_sum.font = Font(bold=True, color="1D4ED8")
+    c_sum.alignment = CENTER
+    c_sum.fill = HEAD_FILL
+    c_sum.border = BORDER
+
+    c_hint = ws.cell(sum_row, 4, "自动校验")
+    c_hint.alignment = CENTER
+    c_hint.fill = HEAD_FILL
+    c_hint.border = BORDER
+    ws.row_dimensions[sum_row].height = 24
+
+    # 给第 4 列「所属课程目标」加上 Excel 原生下拉菜单
+    if targets:
+        dv = DataValidation(
+            type="list",
+            formula1='"' + ",".join(targets) + '"',
+            allow_blank=True,
+        )
+        ws.add_data_validation(dv)
+        dv.add(f"D{first_data_row}:D{last_data_row + 20}")
+
+    for col_i, w in enumerate([22, 10, 14, 20], 1):
+        ws.column_dimensions[get_column_letter(col_i)].width = w
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def parse_paper_structure_for_preview(path: Path, method: dict, matrix: dict) -> tuple[list[dict], list[str]]:
+    """非阻断式解析 4 列《期末试卷结构模板.xlsx》，返回 (paper, errors)，供弹窗实时预览与手工调整。"""
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb.active
+    rows = [list(r) for r in ws.iter_rows(values_only=True)]
+
+    header_idx = None
+    for i, r in enumerate(rows):
+        cells = [eng.clean(c) or "" for c in r]
+        if any("大题" in c for c in cells) and any("满分" in c for c in cells):
+            header_idx = i
+            break
+    if header_idx is None:
+        raise ValueError("未找到表头行（需包含「大题名称」「小题满分」「所属课程目标」）")
+
+    h = [eng.clean(c) or "" for c in rows[header_idx]]
+    c_grp = eng.match_column(h, "大题名称", ("大题", "题型"))
+    c_score = eng.match_column(h, "小题满分", ("满分", "分值"))
+    c_target = eng.match_column(h, "所属课程目标", ("课程目标", "目标"))
+    if None in (c_grp, c_score, c_target):
+        raise ValueError("表头缺少必需列：大题名称、小题满分、所属课程目标")
+
+    order, groups, seq = [], {}, 1
+    current_grp = None
+    default_tg = next(iter(matrix.keys()), "课程目标1")
+    for r in rows[header_idx + 1:]:
+        grp_cell = eng.clean(r[c_grp]) if c_grp < len(r) else None
+        if grp_cell and any(k in grp_cell for k in ("合计", "总分", "小计", "统计")):
+            continue
+        full_s = eng.to_num(r[c_score]) if c_score < len(r) else None
+        tg = eng.clean(r[c_target]) if c_target < len(r) else None
+        if not grp_cell and full_s is None and not tg:
+            continue
+        if grp_cell:
+            current_grp = grp_cell
+        grp = current_grp or "未命名大题"
+        if full_s is None:
+            full_s = 5.0
+        if not tg or tg not in matrix:
+            tg = default_tg
+        if grp not in groups:
+            order.append(grp)
+            groups[grp] = []
+        groups[grp].append({"题号": seq, "满分": full_s, "目标": tg})
+        seq += 1
+
+    paper = [{"大题": g, "小题": groups[g]} for g in order]
+    errs = []
+    try:
+        eng.validate_structure(method, matrix, paper)
+    except ValueError as e:
+        errs.append(str(e))
+    return paper, errs
+
+
+def parse_paper_structure_excel(path: Path, method: dict, matrix: dict) -> list[dict]:
+    """解析 4 列《期末试卷结构模板.xlsx》：
+    - 自动跳过大题之间的空行及底部「合计/总分」汇总行；
+    - 同一大题下若第 1 列「大题名称」留空，自动向下继承上一个大题名称；
+    - 自动连续重排题号 1..N 并校验总分 100 与课程目标合法性。
+    """
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb.active
+    rows = [list(r) for r in ws.iter_rows(values_only=True)]
+
+    header_idx = None
+    for i, r in enumerate(rows):
+        cells = [eng.clean(c) or "" for c in r]
+        if any("大题" in c for c in cells) and any("满分" in c for c in cells):
+            header_idx = i
+            break
+    if header_idx is None:
+        raise ValueError("未找到表头行（需包含「大题名称」「小题满分」「所属课程目标」）")
+
+    h = [eng.clean(c) or "" for c in rows[header_idx]]
+    c_grp = eng.match_column(h, "大题名称", ("大题", "题型"))
+    c_score = eng.match_column(h, "小题满分", ("满分", "分值"))
+    c_target = eng.match_column(h, "所属课程目标", ("课程目标", "目标"))
+    if None in (c_grp, c_score, c_target):
+        raise ValueError("表头缺少必需列：大题名称、小题满分、所属课程目标")
+
+    order, groups, seq = [], {}, 1
+    current_grp = None
+    for r in rows[header_idx + 1:]:
+        grp_cell = eng.clean(r[c_grp]) if c_grp < len(r) else None
+        # 自动跳过底部的“合计 / 总分”行
+        if grp_cell and any(k in grp_cell for k in ("合计", "总分", "小计", "统计")):
+            continue
+
+        full_s = eng.to_num(r[c_score]) if c_score < len(r) else None
+        tg = eng.clean(r[c_target]) if c_target < len(r) else None
+
+        # 纯空行（大题之间的预留空行）直接跳过
+        if not grp_cell and full_s is None and not tg:
+            continue
+
+        if grp_cell:
+            current_grp = grp_cell
+        grp = current_grp
+
+        if not grp or full_s is None or not tg:
+            raise ValueError(f"第 {seq} 题信息不完整，请填写大题名称、小题满分和所属课程目标")
+        if tg not in matrix:
+            raise ValueError(f"第 {seq} 题的课程目标「{tg}」不在当前课程目标中（可选：{list(matrix.keys())}）")
+        if grp not in groups:
+            order.append(grp)
+            groups[grp] = []
+        groups[grp].append({"题号": seq, "满分": full_s, "目标": tg})
+        seq += 1
+
+    paper = [{"大题": g, "小题": groups[g]} for g in order]
+    eng.validate_structure(method, matrix, paper)
+    return paper
+

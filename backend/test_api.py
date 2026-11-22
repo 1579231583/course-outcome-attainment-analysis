@@ -50,9 +50,18 @@ def run_all_tests():
 
     # 2. 公共课程模板只读保护（Copy-on-Write）验收 (P0-3)
     pub_list = api.list_public_course_templates(user=t_user)["templates"]
-    assert len(pub_list) >= 1
-    math_tpl = next((c for c in pub_list if "高等数学" in c["course_name"]), pub_list[0])
-    pub_id = math_tpl["id"]
+    created_temp_pub = False
+    if not pub_list:
+        tmp_pub = db.create_course(
+            {"meta": {"课程名称": "高等数学A（II）", "学期": "2023-2024-2", "班级": "23智能制造1班"}},
+            user_id=a_user["id"],
+            is_public=True,
+        )
+        pub_id = tmp_pub["course_id"]
+        created_temp_pub = True
+    else:
+        math_tpl = next((c for c in pub_list if "高等数学" in c["course_name"]), pub_list[0])
+        pub_id = math_tpl["id"]
     orig_pub = db.get_course_for_user(a_user["id"], "admin", course_id=pub_id)
 
     # 教师选用公共模板 -> 自动克隆为自己的私有副本

@@ -94,6 +94,43 @@ export const api = {
     for (const f of files) fd.append('files', f)
     return request('/api/templates/import-excel-batch', { method: 'POST', body: fd })
   },
+  previewCourseTemplateBatch: (files) => {
+    const fd = new FormData()
+    for (const f of files) fd.append('files', f)
+    return request('/api/templates/preview-excel-batch', { method: 'POST', body: fd })
+  },
+  previewSyllabusPdfBatch: (files) => {
+    const fd = new FormData()
+    for (const f of files) fd.append('files', f)
+    return request('/api/templates/preview-syllabus-pdf', { method: 'POST', body: fd })
+  },
+  publishCourseTemplateBatch: (courses) =>
+    request('/api/templates/publish-batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ courses }),
+    }),
+  downloadPaperTemplate: (courseId, courseName = '课程') =>
+    downloadBlob(
+      `/api/courses/${courseId}/paper-template`,
+      `${courseName}_期末试卷结构模板.xlsx`
+    ),
+  importPaperExcel: (courseId, file) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return request(`/api/courses/${courseId}/paper-import`, { method: 'POST', body: fd })
+  },
+  previewPaperExcel: (courseId, file) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return request(`/api/courses/${courseId}/paper-preview`, { method: 'POST', body: fd })
+  },
+  savePaperJson: (courseId, paper) =>
+    request(`/api/courses/${courseId}/paper-save`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paper }),
+    }),
 
   // 名单与解析
   uploadRoster: (file) => {

@@ -1,14 +1,20 @@
 :root {
-  --bg-canvas: #f8fafc;
+  --bg-canvas: #f3f5f8;
   --bg-card: #ffffff;
-  --border-subtle: #e2e8f0;
+  --border-subtle: #e5e9f0;
   --primary: #2563eb;
-  --primary-dark: #1e3a8a;
+  --primary-hover: #1d4ed8;
+  --primary-soft: #eff6ff;
   --text-main: #0f172a;
-  --text-muted: #64748b;
-  --success: #10b981;
-  --danger: #ef4444;
-  --warning: #f59e0b;
+  --text-secondary: #475569;
+  --text-muted: #94a3b8;
+  --success: #059669;
+  --success-soft: #ecfdf5;
+  --warning: #d97706;
+  --warning-soft: #fffbeb;
+  --danger: #dc2626;
+  --danger-soft: #fef2f2;
+  --shadow-card: 0 1px 2px rgba(15, 23, 42, 0.04), 0 6px 20px rgba(15, 23, 42, 0.03);
 }
 
 * {
@@ -17,66 +23,141 @@
 
 body {
   margin: 0;
-  font-family: 'PingFang SC', 'Microsoft YaHei', system-ui, -apple-system, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', sans-serif;
   background: var(--bg-canvas);
   color: var(--text-main);
   -webkit-font-smoothing: antialiased;
+  font-size: 14px;
 }
 
 .tabular-nums {
   font-variant-numeric: tabular-nums;
 }
 
+/* 统一页面级大标题头 */
+.page-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 24px;
+  flex-wrap: wrap;
+}
+
+.page-header h1 {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--text-main);
+}
+
+.page-header p {
+  margin: 6px 0 0;
+  font-size: 13.5px;
+  color: var(--text-secondary);
+}
+
+/* 无边框微阴影清爽主卡片（告别框套框） */
 .panel-card {
   background: var(--bg-card);
-  border: 1px solid var(--border-subtle);
-  border-radius: 12px;
-  padding: 20px 24px;
-  margin-bottom: 18px;
-  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  border: 1px solid rgba(226, 232, 240, 0.8);
+  border-radius: 16px;
+  padding: 24px 28px;
+  margin-bottom: 20px;
+  box-shadow: var(--shadow-card);
 }
 
 .panel-title {
-  margin: 0 0 14px;
+  margin: 0 0 18px;
   font-size: 16px;
   font-weight: 600;
   color: var(--text-main);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
 .panel-sub {
-  margin: -6px 0 14px;
+  margin: -10px 0 18px;
   font-size: 13px;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .error-cell {
-  background-color: #fef2f2 !important;
-  border: 1.5px solid #ef4444 !important;
+  background-color: var(--danger-soft) !important;
+  border: 1.5px solid var(--danger) !important;
   border-radius: 6px;
 }
 
 .kpi-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 16px;
-  margin-bottom: 18px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 18px;
+  margin-bottom: 22px;
 }
 
 .kpi-card {
-  background: #fff;
-  border: 1px solid var(--border-subtle);
-  border-radius: 12px;
-  padding: 18px 20px;
-  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
+  background: var(--bg-card);
+  border: 1px solid rgba(226, 232, 240, 0.8);
+  border-radius: 16px;
+  padding: 22px 24px;
+  box-shadow: var(--shadow-card);
 }
 
 .kpi-value {
-  font-size: 32px;
+  font-size: 36px;
   font-weight: 700;
-  line-height: 1.2;
-  margin: 8px 0;
+  letter-spacing: -0.03em;
+  line-height: 1.15;
+  margin: 10px 0;
+}
+
+/* Element Plus 全局清爽覆写：更柔和的表头与圆角控件 */
+.el-button {
+  border-radius: 8px !important;
+  font-weight: 500;
+}
+
+.el-input__wrapper,
+.el-select__wrapper {
+  border-radius: 8px !important;
+  box-shadow: 0 0 0 1px #dce2ec inset !important;
+}
+
+.el-input__wrapper.is-focus,
+.el-select__wrapper.is-focused {
+  box-shadow: 0 0 0 1.5px var(--primary) inset !important;
+}
+
+.el-table {
+  --el-table-border-color: #eef2f6;
+  --el-table-header-bg-color: #f8fafc;
+  --el-table-header-text-color: #475569;
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.el-table th.el-table__cell {
+  font-weight: 600;
+  font-size: 12.5px;
+  padding: 10px 0;
+}
+
+.el-tabs__nav-wrap::after {
+  background-color: #e5e9f0 !important;
+  height: 1px !important;
+}
+
+.el-tabs__item {
+  font-size: 14.5px !important;
+  font-weight: 500;
+  color: #64748b !important;
+}
+
+.el-tabs__item.is-active {
+  color: var(--primary) !important;
+  font-weight: 600;
 }

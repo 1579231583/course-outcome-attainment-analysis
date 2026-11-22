@@ -21,6 +21,7 @@ import course_template
 import db
 import diagnostics
 import export_report
+import syllabus_parser
 
 ROOT = Path(__file__).resolve().parent.parent
 FRONTEND_VUE_DIST = ROOT / "frontend-vue" / "dist"
@@ -710,6 +711,273 @@ async def import_course_config_excel(
         raise HTTPException(400, str(e))
     finally:
         path.unlink(missing_ok=True)
+
+
+@app.post("/api/templates/preview-syllabus-pdf")
+async def preview_syllabus_pdf_batch(
+    files: list[UploadFile] = File(...),
+    admin: dict = Depends(require_admin),
+):
+    """管理员上传一份或多份高校《课程教学大纲.pdf》，仅提取大纲真实内容（不强塞假试卷），
+    允许以「仅大纲（待配试卷）」状态直接发布到公共大纲库！
+    """
+    drafts = []
+    for f in files:
+        path = _save_upload(f)
+        try:
+            parsed = syllabus_parser.parse_syllabus_pdf(path, filename=f.filename or "")
+            c = parsed["course"]
+            errs = course_template._collect_course_errors(c, allow_empty_paper=True)
+            drafts.append(
+                {
+                    "source_file": f.filename,
+                    "source_type": "pdf",
+                    "sheet": c["meta"]["课程名称"],
+                    "course": c,
+                    "summary": parsed["extracted_summary"],
+                    "errors": errs,
+                }
+            )
+        except Exception as e:
+            drafts.append(
+                {
+                    "source_file": f.filename,
+                    "source_type": "pdf",
+                    "sheet": f.filename,
+                    "course": None,
+                    "errors": [str(e)],
+                }
+            )
+        finally:
+            path.unlink(missing_ok=True)
+    return {"ok": True, "drafts": drafts}
+
+
+@app.get("/api/courses/{course_id}/paper-template")
+def download_paper_structure_template(
+    course_id: int,
+    user: dict = Depends(get_current_user),
+):
+    """下载专门的 4 列《期末试卷结构模板.xlsx》（管理员给统考课配卷 或 教师给自己课配卷通用）。"""
+    course = _load_course_or_400(user, course_id)
+    buf = course_template.build_paper_structure_template(
+        course_name=course["meta"]["课程名称"],
+        targets=list(course["matrix"].keys()),
+        existing_paper=course["paper"],
+    )
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": (
+                "attachment; filename=paper_structure_template.xlsx; "
+                "filename*=UTF-8''%E6%9C%9F%E6%9C%AB%E8%AF%95%E5%8D%B7%E7%BB%93%E6%9E%84%E6%A8%A1%E6%9D%BF.xlsx"
+            )
+        },
+    )
+
+
+@app.post("/api/courses/{course_id}/paper-preview")
+async def preview_paper_structure_excel(
+    course_id: int,
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user),
+):
+    """非阻断式解析 4 列《期末试卷结构模板.xlsx》，返回 paper 结构与校验提示供前端弹窗实时调整。"""
+    course = _load_course_or_400(user, course_id)
+    path = _save_upload(file)
+    try:
+        paper, errs = course_template.parse_paper_structure_for_preview(
+            path, course["method"], course["matrix"]
+        )
+        return {
+            "ok": True,
+            "course_id": course["course_id"],
+            "course_name": course["meta"]["课程名称"],
+            "targets": list(course["matrix"].keys()),
+            "matrix": course["matrix"],
+            "method": course["method"],
+            "paper": paper,
+            "errors": errs,
+        }
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@app.post("/api/courses/{course_id}/paper-save")
+def save_paper_structure_json(
+    course_id: int,
+    payload: dict,
+    user: dict = Depends(get_current_user),
+):
+    """保存管理员或教师在弹窗中预览调整好的期末试卷结构 JSON。"""
+    course = _load_course_or_400(user, course_id)
+    paper = payload.get("paper") or []
+    q_seq = 1
+    for g in paper:
+        for q in g.get("小题") or []:
+            q["题号"] = q_seq
+            q_seq += 1
+    try:
+        eng.validate_structure(course["method"], course["matrix"], paper)
+        save_payload = {
+            "course_id": course["course_id"],
+            "is_public": course["is_public"],
+            "meta": course["meta"],
+            "threshold": course["threshold"],
+            "method": course["method"],
+            "matrix": course["matrix"],
+            "paper": paper,
+            "target_descriptions": course.get("target_descriptions", {}),
+        }
+        saved, cloned = db.save_course_for_user(
+            save_payload, user["id"], user["role"], teacher_name=user["name"]
+        )
+        return {
+            "ok": True,
+            "message": f"试卷结构已保存（共 {q_seq - 1} 道小题，总分 100 分）",
+            "cloned": cloned,
+            "course_id": saved["course_id"],
+            "paper": saved["paper"],
+        }
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+
+
+@app.post("/api/courses/{course_id}/paper-import")
+async def import_paper_structure_excel(
+    course_id: int,
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user),
+):
+    """上传专门的 4 列《期末试卷结构模板.xlsx》，校验并挂载到指定课程（普通教师操作公共模板时自动克隆私有副本）。"""
+    course = _load_course_or_400(user, course_id)
+    path = _save_upload(file)
+    try:
+        paper = course_template.parse_paper_structure_excel(
+            path, course["method"], course["matrix"]
+        )
+        payload = {
+            "course_id": course["course_id"],
+            "is_public": course["is_public"],
+            "meta": course["meta"],
+            "threshold": course["threshold"],
+            "method": course["method"],
+            "matrix": course["matrix"],
+            "paper": paper,
+            "target_descriptions": course.get("target_descriptions", {}),
+        }
+        saved, cloned = db.save_course_for_user(
+            payload, user["id"], user["role"], teacher_name=user["name"]
+        )
+        return {
+            "ok": True,
+            "message": f"已成功导入 {sum(len(g['小题']) for g in paper)} 道期末小题（总分 100 分）",
+            "cloned": cloned,
+            "course_id": saved["course_id"],
+            "paper": saved["paper"],
+            "config": saved,
+        }
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@app.post("/api/templates/preview-excel-batch")
+async def preview_course_config_excel_batch(
+    files: list[UploadFile] = File(...),
+    admin: dict = Depends(require_admin),
+):
+    """管理员上传课程规则 Excel 后先进入在线预览与实时纠错（不直接写库）：
+    返回所有解析出的课程草稿结构及校验错误列表。
+    """
+    drafts = []
+    for f in files:
+        path = _save_upload(f)
+        try:
+            for item in course_template.parse_config_workbook_for_preview(path):
+                drafts.append(
+                    {
+                        "source_file": f.filename,
+                        "sheet": item["sheet"],
+                        "course": item["course"],
+                        "errors": item["errors"],
+                    }
+                )
+        except Exception as e:
+            drafts.append(
+                {
+                    "source_file": f.filename,
+                    "sheet": f.filename,
+                    "course": None,
+                    "errors": [str(e)],
+                }
+            )
+        finally:
+            path.unlink(missing_ok=True)
+    return {"ok": True, "drafts": drafts}
+
+
+@app.post("/api/templates/publish-batch")
+def publish_previewed_courses_batch(
+    payload: dict,
+    admin: dict = Depends(require_admin),
+):
+    """管理员在网页预览并修正课程规则后，一键批量正式发布到公共课程模板库。"""
+    courses = payload.get("courses") or []
+    if not courses:
+        raise HTTPException(400, "待发布的课程列表为空")
+
+    results = []
+    success_count = 0
+    for idx, c in enumerate(courses, 1):
+        cname = (c.get("meta") or {}).get("课程名称") or f"课程#{idx}"
+        try:
+            # 自动连续编号题号
+            q_seq = 1
+            for g in c.get("paper") or []:
+                for q in g.get("小题") or []:
+                    q["题号"] = q_seq
+                    q_seq += 1
+            errs = course_template._collect_course_errors(c, allow_empty_paper=True)
+            if errs:
+                raise ValueError("；".join(errs))
+            created = db.create_course(
+                c, user_id=admin["id"], is_public=True, teacher_name=admin["name"]
+            )
+            success_count += 1
+            results.append(
+                {
+                    "course_name": created["meta"]["课程名称"],
+                    "semester": created["meta"]["学期"],
+                    "ok": True,
+                    "message": "发布成功",
+                }
+            )
+        except Exception as e:
+            results.append(
+                {
+                    "course_name": cname,
+                    "semester": (c.get("meta") or {}).get("学期") or "—",
+                    "ok": False,
+                    "message": str(e),
+                }
+            )
+
+    return {
+        "ok": True,
+        "total": len(courses),
+        "success_count": success_count,
+        "fail_count": len(courses) - success_count,
+        "results": results,
+    }
 
 
 @app.post("/api/templates/import-excel-batch")
