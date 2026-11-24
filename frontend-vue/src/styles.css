@@ -107,12 +107,103 @@ body {
   box-shadow: var(--shadow-card);
 }
 
+.kpi-label {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
 .kpi-value {
   font-size: 36px;
   font-weight: 700;
   letter-spacing: -0.03em;
   line-height: 1.15;
   margin: 10px 0;
+}
+
+.subtitle {
+  margin: 6px 0 0;
+  font-size: 13.5px;
+  color: var(--text-secondary);
+}
+
+/* 统一全站状态胶囊（ok / warn / err / info） */
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.status-pill .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.status-pill.ok {
+  background: var(--success-soft);
+  color: var(--success);
+}
+.status-pill.ok .dot {
+  background: var(--success);
+}
+
+.status-pill.warn {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+.status-pill.warn .dot {
+  background: var(--warning);
+}
+
+.status-pill.err {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.status-pill.err .dot {
+  background: var(--danger);
+}
+
+.status-pill.info {
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+.status-pill.info .dot {
+  background: var(--primary);
+}
+
+/* 成绩纠错表格内联数字输入框 */
+.cell-input {
+  width: 68px;
+  height: 28px;
+  padding: 0 6px;
+  text-align: center;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-main);
+  background: #ffffff;
+  border: 1px solid #dbe2ec;
+  border-radius: 6px;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.cell-input:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.12);
+}
+
+.cell-input::-webkit-inner-spin-button,
+.cell-input::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }
 
 /* Element Plus 全局清爽覆写：更柔和的表头与圆角控件 */

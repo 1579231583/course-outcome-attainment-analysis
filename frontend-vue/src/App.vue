@@ -2,7 +2,7 @@
   <LoginView v-if="!user" @success="onLoginSuccess" />
 
   <div v-else class="app-shell">
-    <!-- 极简左侧边栏 -->
+    <!-- 极简左侧边栏：管理员 2 项，教师仅 1 项核心导航 -->
     <aside class="sidebar">
       <div class="side-logo">
         <div class="logo-mark">OBE</div>
@@ -25,20 +25,11 @@
 
         <div
           class="nav-item"
-          :class="{ active: activeView === 'workbench' }"
-          @click="activeView = 'workbench'"
+          :class="{ active: activeView === 'tasks' }"
+          @click="goTaskList"
         >
           <el-icon><DataAnalysis /></el-icon>
-          <span>达成度工作台</span>
-        </div>
-
-        <div
-          class="nav-item"
-          :class="{ active: activeView === 'history' }"
-          @click="activeView = 'history'"
-        >
-          <el-icon><Document /></el-icon>
-          <span>历史报告归档</span>
+          <span>我的班级分析</span>
         </div>
       </nav>
 
@@ -56,75 +47,50 @@
 
     <!-- 右侧主工作区 -->
     <div class="main-wrap">
-      <!-- 极简顶栏（绝不把步骤条硬塞进顶栏！） -->
       <header class="topbar">
-        <div v-if="activeView === 'workbench' && cfg" class="top-course-bar">
-          <span class="top-label">当前课程</span>
-          <el-select
-            :model-value="cfg.course_id"
-            style="width: 260px"
-            @change="switchCourse"
-          >
-            <el-option
-              v-for="c in courses"
-              :key="c.id"
-              :label="`${c.course_name} (${c.semester})${c.is_public ? ' · 公共' : ''}`"
-              :value="c.id"
-            />
-          </el-select>
-          <el-button plain @click="createNewCourse">+ 新建课程</el-button>
+        <div v-if="activeView === 'tasks'" class="breadcrumb">
+          <template v-if="mode === 'list'">
+            <span class="bc-current">我的班级分析</span>
+          </template>
+          <template v-else-if="mode === 'score' && currentTask">
+            <span class="bc-link" @click="goTaskList">← 返回班级列表</span>
+            <span class="bc-sep">/</span>
+            <span class="bc-current">{{ currentTask.course_name }} · {{ currentTask.class_name }}</span>
+          </template>
+          <template v-else-if="mode === 'report' && currentTask">
+            <span class="bc-link" @click="goTaskList">我的班级分析</span>
+            <span class="bc-sep">/</span>
+            <span class="bc-link" @click="mode = 'score'">{{ currentTask.course_name }} · {{ currentTask.class_name }}</span>
+            <span class="bc-sep">/</span>
+            <span class="bc-current">达成度诊断报告</span>
+          </template>
         </div>
-        <div v-else-if="activeView === 'history'" class="top-title">历史报告归档</div>
-        <div v-else class="top-title">教务管理后台</div>
+        <div v-else class="bc-current">教务管理后台</div>
       </header>
 
       <main class="content">
-        <!-- 教师工作台：顶部独立干净的 6 步线性进度条 -->
-        <template v-if="activeView === 'workbench' && cfg">
-          <div class="step-track">
-            <div
-              v-for="(label, idx) in stepLabels"
-              :key="idx"
-              class="step-node"
-              :class="{
-                active: step === idx,
-                done: idx < step,
-                disabled: idx === 5 && !calcResult,
-              }"
-              @click="goStep(idx)"
-            >
-              <span class="step-num">{{ idx < step ? '✓' : idx + 1 }}</span>
-              <span class="step-txt">{{ label }}</span>
-            </div>
-          </div>
-
-          <ConfigStep
-            v-if="step <= 3"
-            :cfg="cfg"
-            :current-step="step"
-            @saved="refreshCourseList"
-            @go-step="goStep"
-            @reload-config="loadConfig"
+        <template v-if="activeView === 'tasks'">
+          <TaskList
+            v-if="mode === 'list'"
+            :tasks="tasks"
+            :loading="tasksLoading"
+            @open-score="openTaskScore"
+            @open-report="openTaskReport"
+            @refresh="refreshTasks"
           />
           <ScoreStep
-            v-show="step === 4"
-            :cfg="cfg"
-            :initial-students="loadedStudents"
+            v-else-if="mode === 'score' && currentTask"
+            :task="currentTask"
+            @task-updated="onTaskUpdated"
             @calculated="onCalculated"
-            @roster-updated="(n) => (rosterCount = n)"
+            @view-report="mode = 'report'"
           />
           <ReportStep
-            v-if="step === 5 && calcResult"
-            :result="calcResult"
-            @back="step = 4"
+            v-else-if="mode === 'report' && currentTask"
+            :task="currentTask"
+            @back="mode = 'score'"
           />
         </template>
-
-        <HistoryView
-          v-else-if="activeView === 'history'"
-          @view-report="onViewHistoryReport"
-          @reload-students="onReloadHistoryStudents"
-        />
 
         <AdminView v-else-if="activeView === 'admin'" />
       </main>
@@ -137,119 +103,93 @@ import { onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from './api/client'
 import LoginView from './components/LoginView.vue'
-import ConfigStep from './components/ConfigStep.vue'
+import TaskList from './components/TaskList.vue'
 import ScoreStep from './components/ScoreStep.vue'
 import ReportStep from './components/ReportStep.vue'
-import HistoryView from './components/HistoryView.vue'
 import AdminView from './components/AdminView.vue'
 
-const stepLabels = ['选课程', '定占比', '配目标', '配试卷', '传成绩', '看报告']
 const user = ref(JSON.parse(localStorage.getItem('obe_user') || 'null'))
-const activeView = ref(user.value?.role === 'admin' ? 'admin' : 'workbench')
-const step = ref(0)
-const cfg = ref(null)
-const courses = ref([])
-const rosterCount = ref(0)
-const calcResult = ref(null)
-const loadedStudents = ref([])
+const activeView = ref(user.value?.role === 'admin' ? 'admin' : 'tasks')
+const mode = ref('list') // 'list' | 'score' | 'report'
+const tasks = ref([])
+const tasksLoading = ref(false)
+const currentTask = ref(null)
 
-async function loadConfig(courseId = null) {
+async function refreshTasks() {
+  tasksLoading.value = true
   try {
-    const [cRes, listRes] = await Promise.all([
-      api.getConfig(courseId),
-      api.listCourses(),
-    ])
-    cfg.value = cRes
-    rosterCount.value = cRes.roster_count || 0
-    courses.value = listRes.courses || []
+    const res = await api.listTasks()
+    tasks.value = res.tasks || []
+  } catch (e) {
+    ElMessage.error(e.message)
+  } finally {
+    tasksLoading.value = false
+  }
+}
+
+function goTaskList() {
+  activeView.value = 'tasks'
+  mode.value = 'list'
+  currentTask.value = null
+  refreshTasks()
+}
+
+async function openTaskScore(taskId) {
+  try {
+    const res = await api.getTask(taskId)
+    currentTask.value = res.task
+    activeView.value = 'tasks'
+    mode.value = 'score'
   } catch (e) {
     ElMessage.error(e.message)
   }
 }
 
-async function refreshCourseList() {
-  const res = await api.listCourses()
-  courses.value = res.courses || []
-}
-
-function switchCourse(cid) {
-  loadConfig(cid)
-}
-
-async function createNewCourse() {
+async function openTaskReport(taskId) {
   try {
-    const res = await api.createCourse({
-      meta: { 课程名称: '新课程配置', 学期: '2025-2026-1', 班级: '1班' },
-      threshold: 0.65,
-    })
-    ElMessage.success('已新建私有课程配置')
-    await loadConfig(res.course.course_id)
+    const res = await api.getTask(taskId)
+    currentTask.value = res.task
+    activeView.value = 'tasks'
+    mode.value = res.task.status === 'completed' ? 'report' : 'score'
   } catch (e) {
     ElMessage.error(e.message)
   }
 }
 
-async function goStep(idx) {
-  if (idx === 5 && !calcResult.value) return
-  if (step.value <= 3 && idx === 4 && cfg.value) {
-    try {
-      const res = await api.saveConfig(cfg.value)
-      if (res.config) cfg.value = res.config
-      await refreshCourseList()
-    } catch (e) {
-      ElMessage.warning(`请先完善配置后再上传成绩：${e.message}`)
-      return
-    }
-  }
-  step.value = idx
+function onTaskUpdated(updatedTask) {
+  currentTask.value = updatedTask
+  refreshTasks()
 }
 
-function onCalculated(res) {
-  calcResult.value = res
-  step.value = 5
-}
-
-function onViewHistoryReport(res) {
-  calcResult.value = res
-  activeView.value = 'workbench'
-  step.value = 5
-}
-
-async function onReloadHistoryStudents(rec) {
-  await loadConfig(rec.course_id)
-  if (cfg.value) cfg.value.meta['班级'] = rec.class_name
-  loadedStudents.value = rec.students || []
-  activeView.value = 'workbench'
-  step.value = 4
-  ElMessage.success(`已将 ${rec.class_name} 的成绩载入纠错表格`)
+function onCalculated(updatedTask) {
+  currentTask.value = updatedTask
+  mode.value = 'report'
+  refreshTasks()
 }
 
 function onLoginSuccess(res) {
   user.value = res.user
   localStorage.setItem('obe_user', JSON.stringify(res.user))
   localStorage.setItem('obe_token', res.token)
-  activeView.value = res.user.role === 'admin' ? 'admin' : 'workbench'
-  step.value = 0
-  loadConfig()
+  activeView.value = res.user.role === 'admin' ? 'admin' : 'tasks'
+  mode.value = 'list'
+  refreshTasks()
 }
 
 function logout() {
   user.value = null
+  currentTask.value = null
   localStorage.removeItem('obe_user')
   localStorage.removeItem('obe_token')
 }
 
 onMounted(() => {
-  if (user.value) loadConfig()
+  if (user.value) refreshTasks()
 })
 </script>
 
 <style scoped>
-.app-shell {
-  display: flex;
-  min-height: 100vh;
-}
-
+.app-shell { display: flex; min-height: 100vh; }
 .sidebar {
   width: 224px;
   background: #ffffff;
@@ -258,14 +198,7 @@ onMounted(() => {
   flex-direction: column;
   flex-shrink: 0;
 }
-
-.side-logo {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 22px 20px;
-}
-
+.side-logo { display: flex; align-items: center; gap: 12px; padding: 22px 20px; }
 .logo-mark {
   width: 36px;
   height: 36px;
@@ -277,26 +210,10 @@ onMounted(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  letter-spacing: 0.5px;
 }
-
-.logo-title {
-  font-size: 15px;
-  font-weight: 700;
-  color: #0f172a;
-}
-
-.logo-sub {
-  font-size: 11.5px;
-  color: #94a3b8;
-  margin-top: 1px;
-}
-
-.side-nav {
-  flex: 1;
-  padding: 8px 12px;
-}
-
+.logo-title { font-size: 15px; font-weight: 700; color: #0f172a; }
+.logo-sub { font-size: 11.5px; color: #94a3b8; margin-top: 1px; }
+.side-nav { flex: 1; padding: 8px 12px; }
 .nav-item {
   display: flex;
   align-items: center;
@@ -310,18 +227,8 @@ onMounted(() => {
   margin-bottom: 4px;
   transition: all 0.15s;
 }
-
-.nav-item:hover {
-  background: #f8fafc;
-  color: #0f172a;
-}
-
-.nav-item.active {
-  background: #eff6ff;
-  color: #2563eb;
-  font-weight: 600;
-}
-
+.nav-item:hover { background: #f8fafc; color: #0f172a; }
+.nav-item.active { background: #eff6ff; color: #2563eb; font-weight: 600; }
 .side-footer {
   padding: 16px 18px;
   border-top: 1px solid #f1f5f9;
@@ -329,13 +236,7 @@ onMounted(() => {
   align-items: center;
   justify-content: space-between;
 }
-
-.user-info {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
+.user-info { display: flex; align-items: center; gap: 10px; }
 .avatar {
   width: 34px;
   height: 34px;
@@ -348,123 +249,30 @@ onMounted(() => {
   font-weight: 700;
   font-size: 13px;
 }
-
-.user-name {
-  font-size: 13.5px;
-  font-weight: 600;
-  color: #0f172a;
-}
-
-.user-role {
-  font-size: 11.5px;
-  color: #94a3b8;
-}
-
-.main-wrap {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-}
-
+.user-name { font-size: 13.5px; font-weight: 600; color: #0f172a; }
+.user-role { font-size: 11.5px; color: #94a3b8; }
+.main-wrap { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .topbar {
-  height: 60px;
-  background: rgba(255, 255, 255, 0.85);
+  height: 58px;
+  background: rgba(255, 255, 255, 0.9);
   backdrop-filter: blur(8px);
   border-bottom: 1px solid #e5e9f0;
-  padding: 0 32px;
+  padding: 0 36px;
   display: flex;
   align-items: center;
-  justify-content: space-between;
   position: sticky;
   top: 0;
   z-index: 20;
 }
-
-.top-course-bar {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.top-label {
-  font-size: 13px;
-  font-weight: 500;
-  color: #64748b;
-}
-
-.top-title {
-  font-size: 15px;
-  font-weight: 600;
-  color: #0f172a;
-}
-
+.breadcrumb { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+.bc-link { color: #475569; cursor: pointer; font-weight: 500; transition: color 0.15s; }
+.bc-link:hover { color: #2563eb; }
+.bc-sep { color: #cbd5e1; }
+.bc-current { font-size: 15px; font-weight: 600; color: #0f172a; }
 .content {
-  padding: 28px 36px 64px;
-  max-width: 1240px;
+  padding: 28px 36px 48px;
+  max-width: 1280px;
   width: 100%;
   margin: 0 auto;
-}
-
-/* 干净独立的 6 步线性进度条 */
-.step-track {
-  max-width: 820px;
-  margin: 0 auto 28px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  background: #ffffff;
-  padding: 12px 20px;
-  border-radius: 14px;
-  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
-  border: 1px solid rgba(226, 232, 240, 0.8);
-}
-
-.step-node {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
-  color: #94a3b8;
-  font-size: 13.5px;
-  font-weight: 500;
-  transition: all 0.15s;
-}
-
-.step-num {
-  width: 24px;
-  height: 24px;
-  border-radius: 50%;
-  background: #f1f5f9;
-  color: #64748b;
-  font-size: 12px;
-  font-weight: 700;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.step-node.done {
-  color: #475569;
-}
-
-.step-node.done .step-num {
-  background: #dbeafe;
-  color: #2563eb;
-}
-
-.step-node.active {
-  color: #0f172a;
-  font-weight: 600;
-}
-
-.step-node.active .step-num {
-  background: #2563eb;
-  color: #ffffff;
-}
-
-.step-node.disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
 }
 </style>

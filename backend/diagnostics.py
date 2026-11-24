@@ -141,16 +141,20 @@ def analyze_student_distribution(
 
 
 def compare_with_history(user_id: int, role: str, course_id: int) -> list[dict]:
-    history = db.list_class_reports(user_id, role, course_id=course_id)
+    tasks = db.list_tasks_for_user(user_id, role)
     comparisons = []
-    for h in history[:5]:
-        h_rep = h["report"].get("report", h["report"])
+    for t_item in tasks:
+        if t_item.get("status") != "completed":
+            continue
+        if course_id and t_item.get("syllabus_id") != course_id:
+            continue
+        h_rep = t_item.get("target_summary") or {}
         comparisons.append(
             {
-                "report_id": h["id"],
-                "班级": h["class_name"],
-                "学期": h["semester"],
-                "人数": h["student_count"],
+                "task_id": t_item["id"],
+                "班级": t_item["class_name"],
+                "学期": t_item["semester"],
+                "人数": t_item["student_count"],
                 "各目标达成度": {
                     t: round(v["达成度"], 4)
                     for t, v in h_rep.items()
@@ -158,6 +162,8 @@ def compare_with_history(user_id: int, role: str, course_id: int) -> list[dict]:
                 },
             }
         )
+        if len(comparisons) >= 5:
+            break
     return comparisons
 
 

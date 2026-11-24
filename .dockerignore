@@ -1,0 +1,14 @@
+.git
+.gitignore
+**/__pycache__
+**/*.pyc
+backend/venv
+backend/*.db
+frontend-vue/node_modules
+frontend-vue/.tmp
+用例
+测试数据集
+示例
+*.xlsx
+*.xls
+*.pdf

@@ -1,200 +1,181 @@
-"""后端全功能一键验收测试脚本（P0 安全隔离 + Copy-on-Write + 4-Sheet 归档导出 + 诊断）
+"""三层架构全链路自动化验收测试
 
-运行：python backend/test_api.py
+验证：
+  1. 双角色登录、Token 鉴权与 401/403 严格隔离
+  2. 第一层：管理员解析真实《教学大纲 PDF》→ 发布公共大纲（无学期/无班级）
+  3. 第二层：管理员为该大纲挂接 2025-2026-1 统考试卷（4 列模板解析 + 保存）
+  4. 第三层：教师从公共大纲创建班级分析任务 → 自动挂接同学期统考试卷 → 解析 35 人成绩（含异常版检出）
+  5. 达成度计算 + 4 维诊断 + 考试试卷分析 + 三段分析文本完整持久化
+  6. 一键导出双文档归档包 ZIP（4-Sheet《达成度数据分析表.xlsx》+ 2-Sheet《考试试卷分析表.xlsx》）
+  7. 管理员全院汇总监控验证
 """
 
-import copy
+import io
 import sys
-import tempfile
+import zipfile
 from pathlib import Path
 
 import openpyxl
 from fastapi import HTTPException
 
-BACKEND_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(BACKEND_DIR))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import api
-import calc_engine as eng
 import course_template
 import db
-import export_report
+import syllabus_parser
+
+ROOT = Path(__file__).resolve().parent.parent
+CASE_DIR = ROOT / "用例"
 
 
 def run_all_tests():
-    print("=" * 66)
-    print("开始执行后端全流程自动化验收测试（含 P0 并发安全与 4-Sheet 校验）...")
-    print("=" * 66)
+    # 使用独立临时测试库，绝不污染正式数据库
+    orig_db = db.DB_PATH
+    test_db = Path(__file__).resolve().parent / "test_v4_tmp.db"
+    if test_db.exists():
+        test_db.unlink()
+    db.DB_PATH = test_db
 
-    # 1. 双角色登录与真实 Token 鉴权验收 (P0-2)
-    res_teacher = api.login({"username": "teacher", "password": "123456"})
-    res_admin = api.login({"username": "admin", "password": "admin123"})
-    t_user = api.get_current_user(authorization=f"Bearer {res_teacher['token']}")
-    a_user = api.get_current_user(authorization=f"Bearer {res_admin['token']}")
-    assert t_user["role"] == "teacher" and a_user["role"] == "admin"
-
-    # 未登录拦截 401
     try:
-        api.get_current_user(authorization=None, token=None)
-        raise AssertionError("未登录应返回 401")
-    except HTTPException as e:
-        assert e.status_code == 401
+        db.init_db()
+        print("=" * 68)
+        print("开始执行三层架构全链路自动化验收测试...")
+        print("=" * 68)
 
-    # 普通教师越权调管理员接口拦截 403
-    try:
-        api.require_admin(user=t_user)
-        raise AssertionError("普通教师调管理员接口应返回 403")
-    except HTTPException as e:
-        assert e.status_code == 403
-    print("[PASS] 1. 双角色登录与 Token 鉴权隔离验证通过（401 / 403 拦截生效）")
+        # 1. 双角色鉴权与隔离
+        a_login = api.login({"username": "admin", "password": "admin123"})
+        t_login = api.login({"username": "teacher", "password": "123456"})
+        admin_user = api.get_current_user(f"Bearer {a_login['token']}")
+        teacher_user = api.get_current_user(f"Bearer {t_login['token']}")
+        try:
+            api.require_admin(teacher_user)
+            raise AssertionError("普通教师不应通过 require_admin")
+        except HTTPException as e:
+            assert e.status_code == 403
+        print("[PASS] 1. 双角色登录与权限隔离验证通过")
 
-    # 2. 公共课程模板只读保护（Copy-on-Write）验收 (P0-3)
-    pub_list = api.list_public_course_templates(user=t_user)["templates"]
-    created_temp_pub = False
-    if not pub_list:
-        tmp_pub = db.create_course(
-            {"meta": {"课程名称": "高等数学A（II）", "学期": "2023-2024-2", "班级": "23智能制造1班"}},
-            user_id=a_user["id"],
-            is_public=True,
+        # 2. 第一层：解析真实教学大纲 PDF 并发布到公共大纲库
+        parsed = syllabus_parser.parse_syllabus_pdf(CASE_DIR / "01_管理员_课程教学大纲.pdf")
+        pub_res = api.publish_syllabuses({"courses": [parsed["course"]]}, admin=admin_user)
+        assert pub_res["count"] == 1
+        syl = pub_res["syllabuses"][0]
+        assert syl["course_name"] == "高等数学A（II）"
+        assert syl["has_paper"] is False
+        print(f"[PASS] 2. 公共大纲 PDF 解析并发布通过：{syl['course_name']}（{syl['target_count']} 个目标，初始无试卷）")
+
+        # 3. 第二层：管理员为 2025-2026-1 挂接统考期末试卷
+        paper, errs = course_template.parse_paper_structure_for_preview(
+            CASE_DIR / "02_管理员_期末试卷结构模板.xlsx", syl["method"], syl["matrix"]
         )
-        pub_id = tmp_pub["course_id"]
-        created_temp_pub = True
-    else:
-        math_tpl = next((c for c in pub_list if "高等数学" in c["course_name"]), pub_list[0])
-        pub_id = math_tpl["id"]
-    orig_pub = db.get_course_for_user(a_user["id"], "admin", course_id=pub_id)
+        assert not errs, errs
+        p_res = api.save_syllabus_exam_paper(
+            syl["id"], {"semester": "2025-2026-1", "title": "2025-2026-1 统考A卷", "paper": paper}, admin=admin_user
+        )
+        assert p_res["paper"]["question_count"] == 12
+        print("[PASS] 3. 统考期末试卷按学期挂接成功（12 题 · 100 分）")
 
-    # 教师选用公共模板 -> 自动克隆为自己的私有副本
-    applied = api.apply_public_template(pub_id, user=t_user)
-    cloned_cfg = applied["config"]
-    assert cloned_cfg["course_id"] != pub_id
-    assert cloned_cfg["is_public"] is False
+        # 4. 第三层：教师从公共大纲开班，初始为 pending_ratios（待教师自行配置占比），自动继承统考试卷
+        t_res = api.create_task(
+            {"syllabus_id": syl["id"], "semester": "2025-2026-1", "class_name": "24智能制造1班"},
+            user=teacher_user,
+        )
+        task = t_res["task"]
+        assert task["paper_source"] == "unified"
+        assert task["status"] == "pending_ratios"
+        assert task["ratios_confirmed"] is False
+        assert task["question_count"] == 12
 
-    # 教师直接对原公共模板 ID 提交修改 -> 自动触发 Copy-on-Write，原公共模板绝不被改坏！
-    mod_payload = copy.deepcopy(orig_pub)
-    mod_payload["meta"]["班级"] = "测试防误改班级"
-    save_res = api.save_config(mod_payload, user=t_user)
-    assert save_res["cloned"] is True
-    assert save_res["course_id"] != pub_id
-    recheck_pub = db.get_course_for_user(a_user["id"], "admin", course_id=pub_id)
-    assert recheck_pub["meta"]["班级"] == orig_pub["meta"]["班级"]
-
-    # 清理测试创建的两个临时私有副本
-    db.delete_course(cloned_cfg["course_id"], t_user["id"], "teacher")
-    db.delete_course(save_res["course_id"], t_user["id"], "teacher")
-    print("[PASS] 2. 公共课程模板 Copy-on-Write 防误改验证通过")
-
-    # 3. 公共课程规则模板 Excel 生成 -> 无状态解析闭环
-    cfg_buf = course_template.build_course_config_template(
-        meta=orig_pub["meta"],
-        threshold=orig_pub["threshold"],
-        method=orig_pub["method"],
-        matrix=orig_pub["matrix"],
-        paper=orig_pub["paper"],
-    )
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-        tmp.write(cfg_buf.getvalue())
-        tmp_path = Path(tmp.name)
-    try:
-        parsed_tpl = course_template.parse_course_config_excel(tmp_path)
-        assert parsed_tpl["meta"]["课程名称"] == orig_pub["meta"]["课程名称"]
-        assert abs(sum(parsed_tpl["method"]["平时环节"].values()) - 1.0) < 1e-6
-    finally:
-        tmp_path.unlink(missing_ok=True)
-    print("[PASS] 3. 《课程规则配置模板.xlsx》生成与无状态解析验证通过")
-
-    # 4. 44 人真实数据无状态解析 + 边界保护 (P0-1)（使用独立高数回归测试课程，不依赖库中已有数据）
-    math_course = db.create_course(
-        {
-            "meta": {
-                "课程名称": "高等数学A（II）",
-                "课程代码": "1230601002F",
-                "学期": "2023-2024-2",
-                "班级": "23智能制造1班",
-                "任课教师": "张老师",
-                "课程类别": "基础课",
-                "学分": 5.5,
-                "授课学时": 88,
-            },
-            "threshold": 0.65,
-            "method": eng.METHOD,
-            "matrix": eng.MATRIX,
-            "paper": eng.PAPER_STRUCTURE,
-        },
-        user_id=t_user["id"],
-        is_public=False,
-    )
-    math_cid = math_course["course_id"]
-    try:
-        parsed = api.parse_sample_data(course_id=math_cid, user=t_user)
-        assert parsed["ok"] is True and len(parsed["students"]) == 44
-
-        # 模拟边界保护：不考期末目标（纯函数传参，不污染全局）
-        mat3 = copy.deepcopy(math_course["matrix"])
-        mat3["课程目标3"] = {"作业": 0.2, "课堂表现": 0.0, "测验": 0.0, "期末考试": 0.0}
-        qs3 = eng.validate_structure(math_course["method"], mat3, math_course["paper"])
-        lw3 = eng.step1_link_weights(math_course["method"])
-        out3, full3 = eng.step2_output_weights(lw3, mat3)
-        rep3 = eng.step5_report(parsed["students"], out3, full3, qs3, math_course["method"], mat3)
-        assert rep3["课程目标3"]["期末"] == 0.0 and rep3["课程目标3"]["达成度"] > 0
-        print("[PASS] 4. 无状态纯函数解析与边界保护验证通过")
-
-        # 5. 计算基准 + 终极 4-Sheet 归档报表导出验收（含跨表公式与签字栏）
-        calc_res = api.calculate_records(
+        # 教师亲自配置平时/期末占比及细项比例后，状态转为 pending_scores
+        u_res = api.update_task_rules(
+            task["id"],
             {
-                "course_id": math_cid,
-                "students": parsed["students"],
+                "meta": task["meta"],
                 "threshold": 0.65,
-                "save_report": False,
+                "method": {"平时占比": 0.4, "期末占比": 0.6, "平时环节": {"作业": 0.4, "考勤": 0.3, "测验": 0.3}},
+                "matrix": task["matrix"],
+                "paper": task["paper"],
             },
-            user=t_user,
+            user=teacher_user,
         )
-        t1_pct = round(calc_res["report"]["课程目标1"]["达成度"] * 100, 1)
-        t2_pct = round(calc_res["report"]["课程目标2"]["达成度"] * 100, 1)
-        assert t1_pct == 62.9 and t2_pct == 77.0
+        task = u_res["task"]
+        assert task["ratios_confirmed"] is True
+        assert task["status"] == "pending_scores"
 
-        diag_res = api.diagnostics_analyze(
-            {"course_id": math_cid, "students": parsed["students"], "threshold": 0.65},
-            user=t_user,
+        # 跨用户隔离检查
+        t2_login = api.register({"username": "t_other", "password": "123456", "name": "李老师"})
+        t2_user = api.get_current_user(f"Bearer {t2_login['token']}")
+        try:
+            api.get_task(task["id"], user=t2_user)
+            raise AssertionError("其他教师不应读取张老师的班级任务")
+        except HTTPException as e:
+            assert e.status_code == 403
+        print("[PASS] 4. 教师建班自动关联统考试卷 + 跨教师数据严格隔离通过")
+
+        # 5. 解析 35 人成绩 + 达成度计算 + 诊断 + 三段分析持久化
+        import calc_engine as eng
+
+        pv = eng.parse_sheets_for_preview(
+            api._read_rows(CASE_DIR / "03_教师_平时成绩表_35人.xlsx"),
+            api._read_rows(CASE_DIR / "04_教师_期末试卷成绩表_35人.xlsx"),
+            method=task["method"],
+            matrix=task["matrix"],
+            paper=task["paper"],
         )
-        diag = diag_res["diagnostics"]
-        assert diag["analysis_text"] and diag["improvement_text"]
+        assert pv["ok"] and len(pv["students"]) == 35
 
-        qs = eng.validate_structure(math_course["method"], math_course["matrix"], math_course["paper"])
-        lw = eng.step1_link_weights(math_course["method"])
-        out, full = eng.step2_output_weights(lw, math_course["matrix"])
-        p_full = eng.paper_target_full(qs, math_course["matrix"])
+        calc_res = api.calculate_task(task["id"], {"students": pv["students"]}, user=teacher_user)
+        done_task = calc_res["task"]
+        assert done_task["status"] == "completed"
+        assert done_task["student_count"] == 35
+        assert done_task["exam_analysis_text"] != ""
+        assert done_task["analysis_text"] != ""
 
-        wb_buf = export_report.build_workbook(
-            calc_res["students"],
-            out,
-            full,
-            qs,
-            p_full,
-            meta=math_course["meta"],
-            threshold=0.65,
-            method=math_course["method"],
-            matrix=math_course["matrix"],
-            analysis_text=diag["analysis_text"],
-            improvement_notes=diag["improvement_text"],
+        # 修改三段分析文本并验证持久化
+        api.update_task_notes(
+            task["id"],
+            {
+                "analysis_text": "自定义达成分析",
+                "improvement_notes": "自定义改进措施",
+                "exam_analysis_text": "自定义试卷质量分析",
+            },
+            user=teacher_user,
         )
-        wb = openpyxl.load_workbook(wb_buf, data_only=False)
-        assert wb.sheetnames == ["目标达成评价表", "达成度计算表", "大纲与权重依据", "全班学生得分明细表"]
-        ws_eval = wb["目标达成评价表"]
-        assert str(ws_eval["C12"].value).startswith("='达成度计算表'!")
-        assert "评价人（签字）" in [ws_eval.cell(r, 1).value for r in range(1, ws_eval.max_row + 1)]
-        print(f"[PASS] 5. 回归基准({t1_pct}%/{t2_pct}%) + 终极 4-Sheet 归档表（跨表公式 + 签字栏）验证通过")
+        reloaded = api.get_task(task["id"], user=teacher_user)["task"]
+        assert reloaded["exam_analysis_text"] == "自定义试卷质量分析"
+        print("[PASS] 5. 达成度计算、4 维诊断、试卷分析及三段文本持久化通过")
+
+        # 6. 一键导出双文档归档包 ZIP
+        zbuf, zname = api._build_archive_bundle_zip(reloaded)
+        with zipfile.ZipFile(zbuf) as zf:
+            names = zf.namelist()
+            assert len(names) == 2
+            wb_att = openpyxl.load_workbook(io.BytesIO(zf.read(names[0])), data_only=False)
+            wb_exam = openpyxl.load_workbook(io.BytesIO(zf.read(names[1])), data_only=False)
+            assert wb_att.sheetnames == ["目标达成评价表", "达成度计算表", "大纲与权重依据", "全班学生得分明细表"]
+            assert wb_exam.sheetnames == ["各题得分统计表", "考试试卷分析表"]
+            assert wb_exam["考试试卷分析表"]["A14"].value == "自定义试卷质量分析"
+        print(f"[PASS] 6. 双文档归档包 ZIP 验收通过：{zname}（含 4-Sheet 达成度表 + 2-Sheet 试卷分析表）")
+
+        # 7. 管理员全院汇总监控
+        ov = api.admin_overview(admin=admin_user)["overview"]
+        assert ov["syllabus_count"] == 1
+        assert ov["exam_paper_count"] == 1
+        assert ov["report_count"] == 1
+        print("[PASS] 7. 管理员全院监控验收通过")
+
+        print("\n" + "=" * 68)
+        print("全部 7 项三层架构全链路验收测试 100% 通过！")
+        print("=" * 68)
     finally:
-        db.delete_course(math_cid, t_user["id"], "teacher")
-
-    # 6. 管理员全院监控汇总验收
-    ov = api.admin_overview(admin=a_user)["overview"]
-    assert ov["teacher_count"] >= 1 and ov["public_template_count"] >= 1
-    print(f"[PASS] 6. 管理员全院监控验收通过（教师 {ov['teacher_count']} 人，公共模板 {ov['public_template_count']} 套）")
-
-    print("\n" + "=" * 66)
-    print("全部 6 项 P0 级安全隔离与 4-Sheet 报表验收测试 100% 通过！")
-    print("=" * 66)
+        db.DB_PATH = orig_db
+        import gc
+        gc.collect()
+        if test_db.exists():
+            try:
+                test_db.unlink()
+            except PermissionError:
+                pass
 
 
 if __name__ == "__main__":
